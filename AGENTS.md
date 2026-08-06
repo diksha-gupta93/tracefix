@@ -82,3 +82,13 @@ Every implementation task must finish with:
 - Architecture decisions
 - Security considerations
 - Remaining risks or deferred work
+
+## Local Development Environment
+
+- Use the existing project virtual environment.
+- The standard virtual-environment directory is `.venv`.
+- On Windows, use `.venv\Scripts\python.exe`.
+- Invoke Python tools through `python -m`.
+- Do not download or install an additional Python runtime without explicit human approval.
+- Do not create alternative runtime directories such as `.python312`.
+- If the required Python version is unavailable, stop and report the detected versions and interpreter paths.
