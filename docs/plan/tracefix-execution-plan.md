@@ -8,6 +8,32 @@ The central rule is simple:
 
 Do not batch multiple tasks into one Codex request. Each task must be small enough for Codex to inspect, implement, test, and report without making undocumented assumptions.
 
+## Governing Documents and Precedence
+
+TraceFix development is governed by four levels of documentation:
+
+1. `AGENTS.md`
+   Repository-wide engineering, security, quality, and Codex rules.
+
+2. `docs/architecture/tracefix-system-architecture.md`
+   Canonical system architecture, domain concepts, core contracts,
+   trust boundaries, and long-term design intent.
+
+3. `docs/plan/tracefix-execution-plan.md`
+   Version scope, implementation sequence, and bounded task definitions.
+
+4. `docs/specs/<task>.md`
+   Exact implementation contract for the active task.
+
+An active task specification may intentionally implement only a subset
+of the architecture appropriate to the current version.
+
+A specification may narrow scope, but it must not silently contradict
+the architecture or execution plan.
+
+If a conflict is discovered between these documents, implementation
+must stop and the conflict must be resolved explicitly before coding.
+
 ---
 
 # 1. How to Use This Plan
@@ -189,22 +215,43 @@ Append when v1.0 begins:
 
 # 5. Task Specification Template
 
-```markdown
+```text
 # Task <ID> — <Task Name>
 
-## Goal
-## Context
-## In Scope
-## Out of Scope
-## Interfaces and Data Models
-## Functional Requirements
-## Security Requirements
-## Failure Cases
-## Acceptance Criteria
-## Tests Required
-## Commands That Must Pass
-## Documentation Updates
-## Definition of Done
+We are preparing Task <ID> only.
+
+Read:
+- AGENTS.md
+- docs/architecture/tracefix-system-architecture.md
+- docs/plan/tracefix-execution-plan.md
+- all existing architecture documents relevant to this task
+- existing code relevant to this task
+
+Do not implement application code.
+
+Create:
+docs/specs/<spec-name>.md
+
+The specification must include:
+ 1. Goal
+ 2. Context
+ 3. In Scope
+ 4. Out of Scope
+ 5. Expected Repository Structure
+ 6. Python and Packaging Requirements
+ 7. Development Tool Requirements
+ 8. Cross-Platform Requirements
+ 9. GitHub Actions CI Requirements
+ 10. Security Considerations
+ 11. Failure Cases
+ 12. Acceptance Criteria
+ 13. Tests and Validation Commands
+ 14. Documentation Updates
+ 15. Definition of Done
+
+Do not expand the task beyond the execution plan.
+After creating the spec, report the assumptions that require human review.
+
 ```
 
 ---
