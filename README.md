@@ -1,12 +1,13 @@
 # TraceFix
 
 TraceFix is planned as a repair agent for diagnosing failures, proposing constrained patches,
-and evaluating them safely. Task 0.1.0 provides only the repository foundation: there is no
-application, repair, command-line, sandbox, model, or evaluation behavior yet.
+and evaluating them safely. The current repository contains its typed core schemas and a
+deterministic five-case development benchmark. Repair, command-line, sandbox, model, and
+evaluation behavior remain deferred to later tasks.
 
 ## Prerequisites
 
-- CPython 3.12 (versions before 3.12 and Python 3.13 or newer are unsupported)
+- CPython 3.14
 - `pip`
 
 ## Development setup
@@ -50,16 +51,17 @@ It checks formatting, linting, strict typing, and tests in that order.
 ## Repository layout
 
 - `app/` contains the importable package skeleton.
-- `benchmarks/development/` reserves the future development benchmark location.
+- `benchmarks/development/` contains five seeded defects with typed trusted and model-safe loader
+  views. Hidden tests and reference patches remain evaluator-only; execution is deferred to Docker.
 - `tests/unit/` and `tests/integration/` contain the test suites.
 - `docs/` contains the execution plan, task specifications, and future architecture notes.
 - `scripts/check.py` is the canonical local and CI validation entry point.
 
 ## Current scope
 
-This bootstrap intentionally contains no schemas, benchmark defects, Docker sandbox, graph,
-model provider, API, database, queue, GitHub integration, observability service, production
-behavior, or runtime dependency. Those belong to later, separately specified tasks.
+The current scope is repository-local schemas and benchmark data/loading only. It contains no
+Docker sandbox, graph, model provider, API, database, queue, GitHub integration, observability
+service, or production repair behavior. Those belong to later, separately specified tasks.
 
 `.dockerignore` is deliberately deferred to Task 0.1.3a, when the Docker build context and its
 exclusion policy will be defined together.

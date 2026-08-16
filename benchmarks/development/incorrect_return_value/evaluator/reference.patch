@@ -1,0 +1,6 @@
+--- a/src/normalizer/normalizer.py
++++ b/src/normalizer/normalizer.py
+@@ -1,2 +1,2 @@
+ def normalize(name: str) -> str:
+-    return name.upper()
++    return name.strip().lower()

@@ -1,0 +1,24 @@
+{
+  "case_id": "exception_handling",
+  "repository_path": "repository",
+  "base_revision": "exception_handling-base-v1",
+  "failing_revision": "exception_handling-failing-v1",
+  "visible_tests": [
+    "tests/test_behavior.py"
+  ],
+  "hidden_tests": [
+    "evaluator/hidden_tests/test_regression.py"
+  ],
+  "issue_description": "The exception handling fixture demonstrates an incorrect result.",
+  "expected_behavior": "The focused behavior and its regression case must both pass.",
+  "reference_patch": "evaluator/reference.patch",
+  "expected_changed_files": [
+    "src/parser/parser.py"
+  ],
+  "forbidden_changed_files": [
+    "README.md"
+  ],
+  "bug_category": "exception_handling",
+  "difficulty": "easy",
+  "risk_level": "low"
+}

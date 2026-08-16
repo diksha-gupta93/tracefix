@@ -1,0 +1,8 @@
+--- a/src/greeter/greeter.py
++++ b/src/greeter/greeter.py
+@@ -6,4 +6,4 @@ class UserClient(Protocol):
+ 
+ 
+ def greeting(client: UserClient) -> str:
+-    return f"Hello, {client.fetch_users()}!"  # type: ignore[attr-defined]
++    return f"Hello, {client.fetch_user()}!"

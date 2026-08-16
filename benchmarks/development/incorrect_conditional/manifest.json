@@ -1,0 +1,24 @@
+{
+  "case_id": "incorrect_conditional",
+  "repository_path": "repository",
+  "base_revision": "incorrect_conditional-base-v1",
+  "failing_revision": "incorrect_conditional-failing-v1",
+  "visible_tests": [
+    "tests/test_behavior.py"
+  ],
+  "hidden_tests": [
+    "evaluator/hidden_tests/test_regression.py"
+  ],
+  "issue_description": "The incorrect conditional fixture demonstrates an incorrect result.",
+  "expected_behavior": "The focused behavior and its regression case must both pass.",
+  "reference_patch": "evaluator/reference.patch",
+  "expected_changed_files": [
+    "src/eligibility/eligibility.py"
+  ],
+  "forbidden_changed_files": [
+    "README.md"
+  ],
+  "bug_category": "incorrect_conditional",
+  "difficulty": "easy",
+  "risk_level": "low"
+}

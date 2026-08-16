@@ -146,7 +146,7 @@ Before completing any task:
 - Do not disable security controls to make integration tests easier.
 
 ## Implementation Style
-- Python 3.12.
+- Python 3.14.
 - Pydantic v2 for structured schemas.
 - No implicit untyped dictionary passing across module boundaries.
 - No `Any` unless explicitly justified in the active specification.
@@ -338,7 +338,7 @@ Requirements:
   - `docs/architecture`
   - `scripts`
 - Add root `AGENTS.md`.
-- Add `pyproject.toml` requiring Python 3.12.
+- Add `pyproject.toml` requiring Python 3.14.
 - Configure Ruff, mypy, and pytest.
 - Add `.gitignore`.
 - Add `.gitattributes` with LF line-ending rules.

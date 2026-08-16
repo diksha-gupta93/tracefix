@@ -1,0 +1,9 @@
+--- a/src/parser/parser.py
++++ b/src/parser/parser.py
+@@ -1,5 +1,5 @@
+ def parse_port(value: str) -> int | None:
+     try:
+         return int(value)
+-    except TypeError:
++    except (TypeError, ValueError):
+         return None

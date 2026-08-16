@@ -260,7 +260,7 @@ A separate sequence diagram, state-machine diagram and trust-boundary diagram sh
 
 | Area                   | Primary technology            | Purpose                                           |
 | ---------------------- | ----------------------------- | ------------------------------------------------- |
-| Runtime                | Python 3.12                   | Main application runtime                          |
+| Runtime                | Python 3.14                   | Main application runtime                          |
 | API layer              | FastAPI                       | Manual ingress, webhook ingestion and status APIs |
 | Validation             | Pydantic v2                   | Typed state, requests and model-output schemas    |
 | Workflow orchestration | LangGraph                     | Stateful and resumable repair workflow            |
@@ -2031,7 +2031,7 @@ Before implementation Codex should:
 
 During implementation Codex should:
 
-* Follow Python 3.12 requirements
+* Follow Python 3.14 requirements
 * Use typed interfaces
 * Avoid implicit dictionaries across module boundaries
 * Use Pydantic v2 for structured schemas

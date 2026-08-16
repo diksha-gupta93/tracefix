@@ -45,7 +45,7 @@ Before completing any task:
 
 ## Implementation Style
 
-- Python 3.12.
+- Python 3.14.
 - Pydantic v2 for structured schemas.
 - No implicit untyped dictionary passing across module boundaries.
 - No `Any` unless explicitly justified in the active specification.
@@ -90,5 +90,5 @@ Every implementation task must finish with:
 - On Windows, use `.venv\Scripts\python.exe`.
 - Invoke Python tools through `python -m`.
 - Do not download or install an additional Python runtime without explicit human approval.
-- Do not create alternative runtime directories such as `.python312`.
+- Do not create alternative runtime directories such as `.python314`.
 - If the required Python version is unavailable, stop and report the detected versions and interpreter paths.
