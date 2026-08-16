@@ -1,0 +1,271 @@
+from __future__ import annotations
+
+import subprocess
+from collections.abc import Sequence
+from pathlib import Path
+
+import pytest
+
+from app.sandbox.runner import (
+    DockerCommandError,
+    DockerCommandResult,
+    PytestCommand,
+    SandboxCleanupError,
+    SandboxExecutionError,
+    SandboxRunner,
+    SandboxValidationError,
+)
+
+
+class FakeDockerAdapter:
+    def __init__(self, responses: Sequence[DockerCommandResult | Exception] = ()) -> None:
+        self.responses = list(responses)
+        self.calls: list[tuple[str, ...]] = []
+
+    def run(self, arguments: Sequence[str]) -> DockerCommandResult:
+        self.calls.append(tuple(arguments))
+        if not self.responses:
+            raise AssertionError("unexpected Docker call")
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class FakeClock:
+    def __init__(self, values: Sequence[float]) -> None:
+        self.values = iter(values)
+
+    def __call__(self) -> float:
+        return next(self.values)
+
+
+def completed(exit_code: int = 0, stdout: bytes = b"", stderr: bytes = b"") -> DockerCommandResult:
+    return DockerCommandResult(exit_code=exit_code, stdout=stdout, stderr=stderr)
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        ("python", "-m", "pytest"),
+        ("python", "-m", "pytest", "tests/test_example.py"),
+        (
+            "python",
+            "-m",
+            "pytest",
+            "tests/unit/test_example.py::TestCase::test_case",
+            "tests/test_other.py",
+        ),
+    ],
+)
+def test_accepts_only_approved_pytest_commands(tokens: tuple[str, ...]) -> None:
+    assert PytestCommand(tokens).tokens == tokens
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        (),
+        ("pytest",),
+        ("python", "-m", "unittest"),
+        ("sh", "-c", "pytest"),
+        ("python", "-m", "pytest", "-q"),
+        ("python", "-m", "pytest", "PYTHONPATH=x"),
+        ("python", "-m", "pytest", "@args"),
+        ("python", "-m", "pytest", "src/test_example.py"),
+        ("python", "-m", "pytest", "tests"),
+        ("python", "-m", "pytest", "tests/test_example.txt"),
+        ("python", "-m", "pytest", "/tests/test_example.py"),
+        ("python", "-m", "pytest", "C:/tests/test_example.py"),
+        ("python", "-m", "pytest", "C:\\tests\\test_example.py"),
+        ("python", "-m", "pytest", "//server/tests/test_example.py"),
+        ("python", "-m", "pytest", "tests/../test_example.py"),
+        ("python", "-m", "pytest", "tests/./test_example.py"),
+        ("python", "-m", "pytest", "tests/test*.py"),
+        ("python", "-m", "pytest", "https://host/tests/test.py"),
+        ("python", "-m", "pytest", "tests/test example.py"),
+        ("python", "-m", "pytest", "tests/test.py;id"),
+        ("python", "-m", "pytest", "tests/test.py\nid"),
+        ("python", "-m", "pytest", ""),
+    ],
+)
+def test_rejects_prohibited_command_classes(tokens: tuple[str, ...]) -> None:
+    with pytest.raises(SandboxValidationError):
+        PytestCommand(tokens)
+
+
+def test_invalid_command_causes_no_docker_interaction(tmp_path: Path) -> None:
+    adapter = FakeDockerAdapter()
+    runner = SandboxRunner(adapter)
+
+    with pytest.raises(SandboxValidationError):
+        runner.execute(tmp_path, ("python", "-m", "pytest", "-q"))
+
+    assert adapter.calls == []
+
+
+def test_repository_must_be_absolute_existing_directory(tmp_path: Path) -> None:
+    adapter = FakeDockerAdapter()
+    runner = SandboxRunner(adapter)
+
+    for path in (Path("relative"), tmp_path / "missing"):
+        with pytest.raises(SandboxValidationError):
+            runner.execute(path, ("python", "-m", "pytest"))
+    file_path = tmp_path / "file"
+    file_path.write_text("x", encoding="utf-8")
+    with pytest.raises(SandboxValidationError):
+        runner.execute(file_path, ("python", "-m", "pytest"))
+
+    assert adapter.calls == []
+
+
+def test_repository_symlink_is_rejected(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("this platform does not permit test-created symlinks")
+
+    adapter = FakeDockerAdapter()
+    with pytest.raises(SandboxValidationError):
+        SandboxRunner(adapter).execute(link.absolute(), ("python", "-m", "pytest"))
+    assert adapter.calls == []
+
+
+def test_constructs_fixed_container_and_maps_result(tmp_path: Path) -> None:
+    adapter = FakeDockerAdapter(
+        [
+            completed(),
+            completed(),
+            completed(stdout=b"1\n"),
+            completed(stdout=b"out\xff", stderr=b"err"),
+            completed(),
+        ]
+    )
+    runner = SandboxRunner(adapter, clock=FakeClock([10.0, 10.5]))
+
+    result = runner.execute(tmp_path.resolve(), ("python", "-m", "pytest", "tests/test_example.py"))
+
+    assert result.exit_code == 1
+    assert result.stdout == "out�"
+    assert result.stderr == "err"
+    assert result.duration_seconds == 0.5
+    create = adapter.calls[0]
+    name = create[create.index("--name") + 1]
+    assert name.startswith("tracefix-sandbox-")
+    assert "tracefix-sandbox:0.1.3a" in create
+    assert create[create.index("--network") : create.index("--network") + 2] == (
+        "--network",
+        "none",
+    )
+    assert "--read-only" in create
+    assert create[create.index("--user") : create.index("--user") + 2] == (
+        "--user",
+        "10001:10001",
+    )
+    mount = create[create.index("--mount") + 1]
+    assert mount == f"type=bind,source={tmp_path.resolve()},target=/tracefix/input,readonly"
+    assert "type=tmpfs,destination=/tracefix/workspace,tmpfs-mode=1777" in create
+    assert "type=tmpfs,destination=/tmp,tmpfs-mode=1777" in create
+    assert adapter.calls[1] == ("start", name)
+    assert adapter.calls[2] == ("wait", name)
+    assert adapter.calls[3] == ("logs", name)
+    assert adapter.calls[4] == ("rm", "--force", name)
+
+
+def test_container_names_are_unique(tmp_path: Path) -> None:
+    responses = [completed(), completed(), completed(stdout=b"0\n"), completed(), completed()] * 2
+    adapter = FakeDockerAdapter(responses)
+    runner = SandboxRunner(adapter, clock=FakeClock([0.0, 0.0, 0.0, 0.0]))
+    command = ("python", "-m", "pytest")
+    runner.execute(tmp_path.resolve(), command)
+    runner.execute(tmp_path.resolve(), command)
+
+    names = [call[call.index("--name") + 1] for call in (adapter.calls[0], adapter.calls[5])]
+    assert names[0] != names[1]
+
+
+@pytest.mark.parametrize("wait_code", [0, 1, 5])
+def test_cleanup_occurs_for_every_completed_pytest_exit(tmp_path: Path, wait_code: int) -> None:
+    adapter = FakeDockerAdapter(
+        [
+            completed(),
+            completed(),
+            completed(stdout=f"{wait_code}\n".encode()),
+            completed(),
+            completed(),
+        ]
+    )
+    result = SandboxRunner(adapter, clock=FakeClock([0.0, 0.1])).execute(
+        tmp_path.resolve(), ("python", "-m", "pytest")
+    )
+
+    assert result.exit_code == wait_code
+    assert adapter.calls[-1][:2] == ("rm", "--force")
+
+
+@pytest.mark.parametrize(
+    "responses",
+    [
+        [completed(), DockerCommandError("start failed"), completed()],
+        [completed(), completed(), completed(stdout=b"not-an-integer"), completed()],
+        [
+            completed(),
+            completed(),
+            completed(stdout=b"0\n"),
+            DockerCommandError("logs failed"),
+            completed(),
+        ],
+    ],
+)
+def test_cleanup_after_post_creation_runner_failure(
+    tmp_path: Path, responses: list[DockerCommandResult | Exception]
+) -> None:
+    adapter = FakeDockerAdapter(responses)
+    with pytest.raises(SandboxExecutionError):
+        SandboxRunner(adapter, clock=FakeClock([0.0, 0.1])).execute(
+            tmp_path.resolve(), ("python", "-m", "pytest")
+        )
+    assert adapter.calls[-1][:2] == ("rm", "--force")
+
+
+def test_create_failure_still_attempts_exact_cleanup(tmp_path: Path) -> None:
+    adapter = FakeDockerAdapter([DockerCommandError("create failed"), completed()])
+    with pytest.raises(SandboxExecutionError):
+        SandboxRunner(adapter).execute(tmp_path.resolve(), ("python", "-m", "pytest"))
+    assert adapter.calls[-1][:2] == ("rm", "--force")
+
+
+def test_cleanup_failure_is_not_hidden(tmp_path: Path) -> None:
+    adapter = FakeDockerAdapter(
+        [
+            completed(),
+            completed(),
+            completed(stdout=b"0\n"),
+            completed(),
+            DockerCommandError("remove failed"),
+        ]
+    )
+    with pytest.raises(SandboxCleanupError, match="tracefix-sandbox-"):
+        SandboxRunner(adapter, clock=FakeClock([0.0, 0.1])).execute(
+            tmp_path.resolve(), ("python", "-m", "pytest")
+        )
+
+
+def test_execution_and_cleanup_failures_preserve_both_facts(tmp_path: Path) -> None:
+    execution_error = DockerCommandError("start failed")
+    cleanup_error = DockerCommandError("remove failed")
+    adapter = FakeDockerAdapter([completed(), execution_error, cleanup_error])
+
+    with pytest.raises(SandboxCleanupError, match="execution also failed") as captured:
+        SandboxRunner(adapter).execute(tmp_path.resolve(), ("python", "-m", "pytest"))
+
+    assert captured.value.__cause__ is execution_error
+    assert captured.value.cleanup_cause is cleanup_error
+
+
+def test_subprocess_adapter_contract_does_not_expose_completed_process() -> None:
+    result = DockerCommandResult(exit_code=0, stdout=b"", stderr=b"")
+    assert not isinstance(result, subprocess.CompletedProcess)

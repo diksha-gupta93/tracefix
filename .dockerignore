@@ -1,0 +1,6 @@
+*
+!docker/
+docker/*
+!docker/sandbox/
+docker/sandbox/*
+!docker/sandbox/Dockerfile
