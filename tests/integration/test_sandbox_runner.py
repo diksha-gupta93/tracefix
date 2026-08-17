@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -9,6 +11,7 @@ from app.sandbox.results import TRUNCATION_MARKER, SandboxCompletion, SandboxLim
 from app.sandbox.runner import (
     CONTAINER_NAME_PREFIX,
     SANDBOX_IMAGE,
+    DockerCommandResult,
     PytestCommand,
     SandboxRunner,
     SandboxValidationError,
@@ -30,6 +33,9 @@ def require_docker_and_image() -> None:
         pytest.skip("Docker CLI is unavailable")
     if version.returncode != 0 or version.stdout.strip() != b"linux":
         pytest.skip("a usable Linux-container Docker daemon is unavailable")
+    security = _docker("info", "--format", "{{json .SecurityOptions}}")
+    if security.returncode != 0 or b"name=seccomp" not in security.stdout:
+        pytest.fail("the Linux Docker daemon must report seccomp support")
     image = _docker("image", "inspect", SANDBOX_IMAGE)
     if image.returncode != 0:
         pytest.fail(
@@ -57,9 +63,10 @@ def _write_repository(repository: Path, test_source: str) -> None:
     # the sandbox's fixed non-root user otherwise cannot traverse the prepared
     # repository mounted at /tracefix/input. These permissions expose only the
     # synthetic repository; the bind mount remains read-only in the container.
-    repository.chmod(0o755)
-    tests.chmod(0o755)
-    test_file.chmod(0o644)
+    if os.name != "nt":
+        repository.chmod(0o755)
+        tests.chmod(0o755)
+        test_file.chmod(0o644)
 
 
 def test_passing_pytest_observes_required_container_controls(tmp_path: Path) -> None:
@@ -73,16 +80,38 @@ from pathlib import Path
 def test_controls_and_output():
     assert os.getuid() == 10001
     assert os.getgid() == 10001
-    Path('workspace-write.txt').write_text('writable', encoding='utf-8')
+    status = Path('/proc/self/status').read_text(encoding='utf-8')
+    fields = dict(line.split(':', 1) for line in status.splitlines() if ':' in line)
+    assert int(fields['CapEff'].strip(), 16) == 0
+    assert fields['NoNewPrivs'].strip() == '1'
     try:
-        Path('/root-write.txt').write_text('forbidden', encoding='utf-8')
+        os.setuid(0)
     except OSError:
         pass
     else:
-        raise AssertionError('container root filesystem was writable')
-    with socket.socket() as connection:
-        connection.settimeout(1.0)
-        assert connection.connect_ex(('1.1.1.1', 53)) != 0
+        raise AssertionError('numeric non-root process gained root')
+    Path('workspace-write.txt').write_text('writable', encoding='utf-8')
+    Path('/tmp/temp-write.txt').write_text('writable', encoding='utf-8')
+    for forbidden in (
+        Path('/root-write.txt'),
+        Path('/root/tracefix-write.txt'),
+        Path('/etc/tracefix-write.txt'),
+        Path('/tracefix/input/tracefix-write.txt'),
+    ):
+        try:
+            forbidden.write_text('forbidden', encoding='utf-8')
+        except OSError:
+            pass
+        else:
+            raise AssertionError(f'{forbidden.parent} was writable')
+    assert [name for _, name in socket.if_nameindex()] == ['lo']
+    assert not Path('/var/run/docker.sock').exists()
+    assert not Path('/run/docker.sock').exists()
+    for credential in (
+        Path('/root/.ssh'), Path('/root/.docker'), Path('/root/.aws'),
+        Path('/root/.config/gcloud'), Path('/root/.azure'), Path('/root/.netrc'),
+    ):
+        assert not credential.exists()
     print('sandbox-stdout-marker')
 """,
     )
@@ -103,6 +132,70 @@ def test_controls_and_output():
     assert "1 passed" in result.stdout
     assert result.stderr == ""
     assert result.duration_seconds >= 0.0
+    assert _containers() == before
+
+
+def test_host_environment_is_not_inherited(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRACEFIX_SYNTHETIC_SECRET", "not-for-container")
+    monkeypatch.setenv("HTTPS_PROXY", "http://not-for-container")
+    _write_repository(
+        tmp_path,
+        """import os
+
+
+def test_environment_allowlist():
+    assert os.environ.get('PYTHONDONTWRITEBYTECODE') == '1'
+    assert os.environ.get('PYTHONUNBUFFERED') == '1'
+    assert 'TRACEFIX_SYNTHETIC_SECRET' not in os.environ
+    assert 'HTTPS_PROXY' not in os.environ
+""",
+    )
+    result = SandboxRunner(SubprocessDockerCommandAdapter()).execute(
+        tmp_path.resolve(), ("python", "-m", "pytest")
+    )
+    assert result.exit_code == 0
+
+
+def test_project_root_mount_is_rejected_without_container_creation() -> None:
+    before = _containers()
+    with pytest.raises(SandboxValidationError):
+        SandboxRunner(SubprocessDockerCommandAdapter()).execute(
+            Path(__file__).resolve().parents[2], ("python", "-m", "pytest")
+        )
+    assert _containers() == before
+
+
+class CrashAfterCreateAdapter:
+    def __init__(self) -> None:
+        self._delegate = SubprocessDockerCommandAdapter()
+
+    def run(
+        self,
+        arguments: Sequence[str],
+        *,
+        timeout_seconds: float | None = None,
+        stdout_bytes: int = 65_536,
+        stderr_bytes: int = 65_536,
+        check: bool = True,
+    ) -> DockerCommandResult:
+        if arguments[:1] == ("start",):
+            raise RuntimeError("injected runner crash")
+        return self._delegate.run(
+            arguments,
+            timeout_seconds=timeout_seconds,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            check=check,
+        )
+
+
+def test_injected_runner_crash_removes_exact_container(tmp_path: Path) -> None:
+    _write_repository(tmp_path, "def test_never_started():\n    assert True\n")
+    before = _containers()
+    with pytest.raises(RuntimeError, match="injected runner crash"):
+        SandboxRunner(CrashAfterCreateAdapter()).execute(
+            tmp_path.resolve(), ("python", "-m", "pytest")
+        )
     assert _containers() == before
 
 

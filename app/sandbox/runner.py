@@ -3,16 +3,17 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import subprocess
 import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import IO, Protocol
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from app.sandbox.results import (
     TRUNCATION_MARKER,
@@ -27,9 +28,16 @@ _CONTAINER_INPUT = "/tracefix/input"
 _CONTAINER_WORKSPACE = "/tracefix/workspace"
 _CONTAINER_TEMP = "/tmp"
 _CONTAINER_USER = "10001:10001"
+_FIXED_ENVIRONMENT = ("PYTHONDONTWRITEBYTECODE=1", "PYTHONUNBUFFERED=1")
 _INFRASTRUCTURE_OUTPUT_LIMIT = 65_536
 _FORBIDDEN_PATH_CHARACTERS = frozenset("*?[]{};&|<>`$!()\"'")
 _CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
+_WINDOWS_REPARSE_POINT = 0x400
+_DOCKER_INFO_ARGUMENTS = (
+    "info",
+    "--format",
+    "{{json .}}",
+)
 
 
 class SandboxError(Exception):
@@ -210,24 +218,126 @@ def _validate_test_path(value: str) -> None:
         raise SandboxValidationError("invalid pytest test path")
 
 
+@dataclass(frozen=True, slots=True)
+class _FilesystemIdentity:
+    relative_path: PurePath
+    device: int
+    inode: int
+    mode: int
+    reparse_tag: int
+
+
+def _identity(path: Path, relative_path: PurePath) -> _FilesystemIdentity:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise SandboxValidationError(
+            "prepared repository could not be completely inspected"
+        ) from error
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    if path.is_symlink() or attributes & _WINDOWS_REPARSE_POINT:
+        raise SandboxValidationError("prepared repository contains a filesystem alias")
+    if not stat.S_ISDIR(metadata.st_mode) and not stat.S_ISREG(metadata.st_mode):
+        raise SandboxValidationError("prepared repository contains an unsupported filesystem entry")
+    return _FilesystemIdentity(
+        relative_path=relative_path,
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        mode=metadata.st_mode,
+        reparse_tag=getattr(metadata, "st_reparse_tag", 0),
+    )
+
+
+def _tree_snapshot(repository: Path) -> tuple[_FilesystemIdentity, ...]:
+    identities: list[_FilesystemIdentity] = []
+
+    def inspect(directory: Path, relative_directory: PurePath) -> None:
+        try:
+            with os.scandir(directory) as entries:
+                ordered = sorted(entries, key=lambda entry: os.path.normcase(entry.name))
+        except OSError as error:
+            raise SandboxValidationError(
+                "prepared repository could not be completely inspected"
+            ) from error
+        for entry in ordered:
+            relative = relative_directory / entry.name
+            entry_path = Path(entry.path)
+            identity = _identity(entry_path, relative)
+            identities.append(identity)
+            if stat.S_ISDIR(identity.mode):
+                inspect(entry_path, relative)
+
+    inspect(repository, PurePath())
+    return tuple(identities)
+
+
+def _same_or_ancestor(candidate: Path, protected: Path) -> bool:
+    try:
+        protected.relative_to(candidate)
+    except ValueError:
+        return False
+    return True
+
+
+def _protected_locations() -> tuple[Path, ...]:
+    home = Path.home().resolve(strict=False)
+    project_root = Path(__file__).resolve().parents[2]
+    return (
+        project_root,
+        home,
+        home / ".ssh",
+        home / ".docker",
+        home / ".aws",
+        home / ".config" / "gcloud",
+        home / ".azure",
+        home / ".netrc",
+        home / "_netrc",
+        home / ".npmrc",
+        home / ".pypirc",
+        Path("/var/run/docker.sock"),
+        Path("/run/docker.sock"),
+    )
+
+
+def _is_windows_docker_pipe(path: Path) -> bool:
+    normalized = os.path.normcase(os.fspath(path)).replace("/", "\\")
+    return normalized == r"\\.\pipe\docker_engine"
+
+
 def _validated_repository(repository: Path) -> Path:
     if not repository.is_absolute():
         raise SandboxValidationError("prepared repository path must be absolute")
+    if _is_windows_docker_pipe(repository):
+        raise SandboxValidationError("prepared repository is a protected host location")
     try:
-        before = repository.lstat()
-        if repository.is_symlink():
-            raise SandboxValidationError("prepared repository must not be a symlink")
-        resolved, after = repository.resolve(strict=True), repository.lstat()
+        before = _identity(repository, PurePath())
+        resolved = repository.resolve(strict=True)
     except SandboxValidationError:
         raise
     except (FileNotFoundError, OSError, RuntimeError) as error:
         raise SandboxValidationError("prepared repository is missing or unstable") from error
     if not resolved.is_dir():
         raise SandboxValidationError("prepared repository must be a directory")
-    if resolved != repository.resolve() or (before.st_dev, before.st_ino, before.st_mode) != (
-        after.st_dev,
-        after.st_ino,
-        after.st_mode,
+    if any(
+        _same_or_ancestor(resolved, protected.resolve(strict=False))
+        for protected in _protected_locations()
+    ):
+        raise SandboxValidationError("prepared repository is a protected host location")
+    first_snapshot = _tree_snapshot(resolved)
+    second_snapshot = _tree_snapshot(resolved)
+    try:
+        after = repository.lstat()
+    except OSError as error:
+        raise SandboxValidationError("prepared repository changed during validation") from error
+    if (
+        resolved != repository.resolve()
+        or (before.device, before.inode, before.mode)
+        != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+        )
+        or first_snapshot != second_snapshot
     ):
         raise SandboxValidationError("prepared repository changed during validation")
     return resolved
@@ -237,6 +347,19 @@ class _DockerState(BaseModel):
     model_config = ConfigDict(extra="ignore", strict=True)
     OOMKilled: bool
     Running: bool
+
+
+class _DockerInfo(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True, frozen=True)
+    OSType: str
+    SecurityOptions: tuple[str, ...]
+
+    @field_validator("SecurityOptions", mode="before")
+    @classmethod
+    def freeze_security_options(cls, value: object) -> object:
+        if isinstance(value, list):
+            return tuple(value)
+        return value
 
 
 class SandboxRunner:
@@ -250,6 +373,7 @@ class SandboxRunner:
     ) -> SandboxResult:
         effective = limits if limits is not None else SandboxLimits()
         command, prepared = PytestCommand(command_tokens), _validated_repository(repository)
+        self._validate_daemon_security()
         name = f"{CONTAINER_NAME_PREFIX}{uuid.uuid4().hex}"
         started = self._clock()
         execution_error: BaseException | None = None
@@ -335,6 +459,29 @@ class SandboxRunner:
         except (json.JSONDecodeError, UnicodeDecodeError, ValidationError) as error:
             raise SandboxExecutionError("Docker inspect returned malformed state") from error
 
+    def _validate_daemon_security(self) -> None:
+        try:
+            response = self._docker.run(_DOCKER_INFO_ARGUMENTS)
+            info = _DockerInfo.model_validate(json.loads(response.stdout))
+        except (
+            DockerCommandError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            ValidationError,
+        ) as error:
+            raise SandboxValidationError(
+                "Docker daemon security posture could not be validated"
+            ) from error
+        if info.OSType != "linux":
+            raise SandboxValidationError("Docker daemon must serve Linux containers")
+        normalized = tuple(option.casefold() for option in info.SecurityOptions)
+        if not any(
+            option == "name=seccomp" or option.startswith("name=seccomp,") for option in normalized
+        ):
+            raise SandboxValidationError("Docker daemon must report seccomp support")
+        if any("seccomp=unconfined" in option for option in normalized):
+            raise SandboxValidationError("unconfined seccomp is prohibited")
+
     @staticmethod
     def _create_arguments(
         name: str, repository: Path, command: PytestCommand, limits: SandboxLimits
@@ -348,6 +495,10 @@ class SandboxRunner:
             "--network",
             "none",
             "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges=true",
             "--user",
             _CONTAINER_USER,
             "--cpus",
@@ -371,9 +522,9 @@ class SandboxRunner:
             "--mount",
             f"type=tmpfs,destination={_CONTAINER_TEMP},tmpfs-mode=1777",
             "--env",
-            "PYTHONDONTWRITEBYTECODE=1",
+            _FIXED_ENVIRONMENT[0],
             "--env",
-            "PYTHONUNBUFFERED=1",
+            _FIXED_ENVIRONMENT[1],
             SANDBOX_IMAGE,
             *command.test_paths,
         )

@@ -10,7 +10,8 @@ deferred to later tasks.
 
 - CPython 3.14
 - `pip`
-- Docker with a usable Linux-container daemon (Docker Desktop is supported on Windows)
+- Docker with a usable Linux-container daemon and built-in seccomp support (Docker Desktop is
+  supported on Windows)
 
 ## Development setup
 
@@ -57,7 +58,8 @@ python scripts/check.py
 It checks formatting, linting, strict typing, unit tests, and Docker integration tests in that
 order. On a developer machine, Docker integration tests skip only when the Docker CLI or a usable
 Linux-container daemon is unavailable. A missing prebuilt image is a failure with the build command
-shown above. CI builds the image first, so integration tests must execute there.
+shown above. A daemon that is available but does not report seccomp support is a failure. CI builds
+the image first, so the complete adversarial integration suite must execute there.
 
 ## Repository layout
 
@@ -71,10 +73,19 @@ shown above. CI builds the image first, so integration tests must execute there.
 
 ## Sandbox scope
 
-Each execution uses a fresh, uniquely named Linux container. The prepared repository is the only
-host bind mount and is mounted read-only; the runner copies it into a fresh writable container
-workspace. The container runs as numeric non-root UID/GID `10001:10001`, with networking disabled
-and a read-only root filesystem. The runner applies typed immutable defaults of 1 CPU, 512 MiB
+Each execution uses a fresh, uniquely named Linux container after validating that the daemon serves
+Linux containers with seccomp enabled. Docker's built-in default seccomp profile remains active;
+the runner exposes no security-profile override. The prepared repository is the only host bind
+mount and is mounted read-only after a complete, stable filesystem inspection. Protected host
+locations, protected-path ancestors, symlinks, junctions, reparse points, unsupported entries, and
+inspection failures are rejected before container creation. The runner does not inspect credential
+file contents.
+
+The container runs as numeric non-root UID/GID `10001:10001`, with all capabilities dropped,
+`no-new-privileges` enabled, networking disabled, and a read-only root filesystem. Only the fixed
+workspace and temporary directory are writable tmpfs mounts. The environment is a fixed allowlist
+containing deterministic Python settings; host secrets, credentials, proxy settings, and Docker
+configuration are not inherited. The runner applies typed immutable defaults of 1 CPU, 512 MiB
 memory, 128 processes, a 120-second host deadline, and independent 1 MiB returned stdout and
 stderr limits. Callers customize them by passing a strict `SandboxLimits` instance. Docker uses a
 bounded aggregate local log; the adapter retains each returned stream independently within its
@@ -86,8 +97,11 @@ ASCII marker `[tracefix output truncated]`, and its complete UTF-8 encoding incl
 never exceeds its byte limit. The exact generated container is forcibly terminated on timeout and
 removed after every outcome.
 
-This is the Task 0.1.3b resource-bounded sandbox, not final hardening. Capability dropping,
-`no-new-privileges`, explicit
-seccomp selection, sensitive-host-path policy, and the full adversarial suite remain deferred to
-Task 0.1.3c. TraceFix still contains no graph, model provider, API, database, queue, GitHub
-integration, observability service, or production repair workflow.
+The sandbox assumes the Docker daemon, fixed project-owned image, host administrator, and Docker
+engine are trusted. It does not protect against a malicious daemon or image, host compromise,
+Docker engine vulnerabilities, or abrupt host-process/operating-system/daemon loss. Repeated
+filesystem identity checks reduce path-confusion risk but cannot eliminate races caused by a
+hostile local process mutating a prepared workspace concurrently. Rootless Docker, custom seccomp,
+user namespaces, AppArmor/SELinux policy, alternate runtimes, dependency installation, and repair
+patch policy remain outside Task 0.1.3c. TraceFix still contains no graph, model provider, API,
+database, queue, GitHub integration, observability service, or production repair workflow.

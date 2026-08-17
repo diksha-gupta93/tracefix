@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Sequence
 from pathlib import Path
@@ -20,10 +21,22 @@ from app.sandbox.runner import (
 
 
 class FakeDockerAdapter:
-    def __init__(self, responses: Sequence[DockerCommandResult | Exception] = ()) -> None:
+    def __init__(
+        self,
+        responses: Sequence[DockerCommandResult | Exception] = (),
+        *,
+        docker_info: DockerCommandResult | Exception | None = None,
+    ) -> None:
         self.responses = list(responses)
         self.calls: list[tuple[str, ...]] = []
         self.options: list[tuple[float | None, int, int]] = []
+        self.docker_info = docker_info or completed(
+            stdout=b'{"OSType":"linux","SecurityOptions":["name=seccomp,profile=builtin"]}'
+        )
+
+    @property
+    def container_calls(self) -> list[tuple[str, ...]]:
+        return [call for call in self.calls if call[:1] != ("info",)]
 
     def run(
         self,
@@ -36,6 +49,10 @@ class FakeDockerAdapter:
     ) -> DockerCommandResult:
         self.calls.append(tuple(arguments))
         self.options.append((timeout_seconds, stdout_bytes, stderr_bytes))
+        if arguments[:1] == ("info",):
+            if isinstance(self.docker_info, Exception):
+                raise self.docker_info
+            return self.docker_info
         if not self.responses:
             raise AssertionError("unexpected Docker call")
         response = self.responses.pop(0)
@@ -152,6 +169,145 @@ def test_repository_symlink_is_rejected(tmp_path: Path) -> None:
     assert adapter.calls == []
 
 
+def test_nested_repository_symlink_is_rejected_before_docker(tmp_path: Path) -> None:
+    target = tmp_path.parent / "outside"
+    target.mkdir(exist_ok=True)
+    link = tmp_path / "nested-link"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("this platform does not permit test-created symlinks")
+
+    adapter = FakeDockerAdapter()
+    with pytest.raises(SandboxValidationError):
+        SandboxRunner(adapter).execute(tmp_path.resolve(), ("python", "-m", "pytest"))
+    assert adapter.calls == []
+
+
+@pytest.mark.parametrize(
+    "protected",
+    [
+        Path(__file__).resolve().parents[2],
+        Path.home(),
+    ],
+)
+def test_protected_locations_are_rejected_without_docker(protected: Path) -> None:
+    adapter = FakeDockerAdapter()
+    with pytest.raises(SandboxValidationError):
+        SandboxRunner(adapter).execute(protected.absolute(), ("python", "-m", "pytest"))
+    assert adapter.calls == []
+
+
+def test_ancestor_of_home_is_rejected_without_docker() -> None:
+    ancestor = Path(Path.home().anchor)
+    adapter = FakeDockerAdapter()
+    with pytest.raises(SandboxValidationError):
+        SandboxRunner(adapter).execute(ancestor, ("python", "-m", "pytest"))
+    assert adapter.calls == []
+
+
+def test_protected_policy_contains_required_credential_and_socket_locations() -> None:
+    import app.sandbox.runner as runner_module
+
+    protected = {os.path.normcase(os.fspath(path)) for path in runner_module._protected_locations()}
+    home = Path.home().resolve(strict=False)
+    required = {
+        home / ".ssh",
+        home / ".docker",
+        home / ".aws",
+        home / ".config" / "gcloud",
+        home / ".azure",
+        home / ".netrc",
+        home / "_netrc",
+        home / ".npmrc",
+        home / ".pypirc",
+        Path("/var/run/docker.sock"),
+        Path("/run/docker.sock"),
+    }
+    assert {os.path.normcase(os.fspath(path)) for path in required} <= protected
+
+
+def test_windows_docker_named_pipe_form_is_protected() -> None:
+    import app.sandbox.runner as runner_module
+
+    assert runner_module._is_windows_docker_pipe(Path(r"\\.\pipe\docker_engine"))
+
+
+def test_incomplete_repository_inspection_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_scandir = os.scandir
+
+    def denied(path: os.PathLike[str] | str) -> os.ScandirIterator[str]:
+        if Path(path) == tmp_path.resolve():
+            raise PermissionError("synthetic denial")
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", denied)
+    adapter = FakeDockerAdapter()
+    with pytest.raises(SandboxValidationError):
+        SandboxRunner(adapter).execute(tmp_path.resolve(), ("python", "-m", "pytest"))
+    assert adapter.calls == []
+
+
+def test_repository_identity_change_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.sandbox.runner as runner_module
+
+    original_snapshot = runner_module._tree_snapshot
+    snapshots = iter((original_snapshot(tmp_path), ()))
+    monkeypatch.setattr(runner_module, "_tree_snapshot", lambda repository: next(snapshots))
+    (tmp_path / "entry").write_text("content", encoding="utf-8")
+    snapshots = iter((original_snapshot(tmp_path), ()))
+    adapter = FakeDockerAdapter()
+    with pytest.raises(SandboxValidationError):
+        SandboxRunner(adapter).execute(tmp_path.resolve(), ("python", "-m", "pytest"))
+    assert adapter.calls == []
+
+
+@pytest.mark.parametrize(
+    "docker_info",
+    [
+        completed(stdout=b'{"OSType":"windows","SecurityOptions":["name=seccomp"]}'),
+        completed(stdout=b'{"OSType":"linux","SecurityOptions":[]}'),
+        completed(stdout=b"not-json"),
+        completed(stdout=b'{"OSType":"linux","SecurityOptions":["seccomp=unconfined"]}'),
+        DockerCommandError("daemon unavailable"),
+    ],
+)
+def test_invalid_daemon_security_posture_prevents_container_creation(
+    tmp_path: Path, docker_info: DockerCommandResult | Exception
+) -> None:
+    adapter = FakeDockerAdapter(docker_info=docker_info)
+    with pytest.raises(SandboxValidationError):
+        SandboxRunner(adapter).execute(tmp_path.resolve(), ("python", "-m", "pytest"))
+    assert adapter.calls[0][0] == "info"
+    assert not any(call[0] == "create" for call in adapter.calls)
+
+
+def test_create_environment_and_mounts_are_fixed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TRACEFIX_SYNTHETIC_SECRET", "must-not-cross-boundary")
+    monkeypatch.setenv("HTTPS_PROXY", "http://must-not-cross-boundary")
+    adapter = FakeDockerAdapter(
+        [completed(), completed(), completed(stdout=b"0\n"), state(), completed()]
+    )
+    SandboxRunner(adapter, clock=FakeClock([0.0, 0.1])).execute(
+        tmp_path.resolve(), ("python", "-m", "pytest")
+    )
+    create = adapter.container_calls[0]
+    environments = tuple(
+        create[index + 1] for index, value in enumerate(create) if value == "--env"
+    )
+    mounts = tuple(create[index + 1] for index, value in enumerate(create) if value == "--mount")
+    assert environments == ("PYTHONDONTWRITEBYTECODE=1", "PYTHONUNBUFFERED=1")
+    assert len(mounts) == 3
+    assert sum(mount.startswith("type=bind,") for mount in mounts) == 1
+    assert "must-not-cross-boundary" not in "\0".join(create)
+
+
 def test_constructs_fixed_container_and_maps_result(tmp_path: Path) -> None:
     adapter = FakeDockerAdapter(
         [
@@ -170,7 +326,8 @@ def test_constructs_fixed_container_and_maps_result(tmp_path: Path) -> None:
     assert result.stdout == "out�"
     assert result.stderr == "err"
     assert result.duration_seconds == 0.5
-    create = adapter.calls[0]
+    calls = adapter.container_calls
+    create = calls[0]
     name = create[create.index("--name") + 1]
     assert name.startswith("tracefix-sandbox-")
     assert "tracefix-sandbox:0.1.3a" in create
@@ -179,6 +336,15 @@ def test_constructs_fixed_container_and_maps_result(tmp_path: Path) -> None:
         "none",
     )
     assert "--read-only" in create
+    assert create[create.index("--cap-drop") : create.index("--cap-drop") + 2] == (
+        "--cap-drop",
+        "ALL",
+    )
+    assert create[create.index("--security-opt") : create.index("--security-opt") + 2] == (
+        "--security-opt",
+        "no-new-privileges=true",
+    )
+    assert not any("seccomp=unconfined" in argument for argument in create)
     assert create[create.index("--user") : create.index("--user") + 2] == (
         "--user",
         "10001:10001",
@@ -187,10 +353,10 @@ def test_constructs_fixed_container_and_maps_result(tmp_path: Path) -> None:
     assert mount == f"type=bind,source={tmp_path.resolve()},target=/tracefix/input,readonly"
     assert "type=tmpfs,destination=/tracefix/workspace,tmpfs-mode=1777" in create
     assert "type=tmpfs,destination=/tmp,tmpfs-mode=1777" in create
-    assert adapter.calls[1] == ("start", "--attach", name)
-    assert adapter.calls[2] == ("wait", name)
-    assert adapter.calls[3][:2] == ("inspect", "--format")
-    assert adapter.calls[4] == ("rm", "--force", name)
+    assert calls[1] == ("start", "--attach", name)
+    assert calls[2] == ("wait", name)
+    assert calls[3][:2] == ("inspect", "--format")
+    assert calls[4] == ("rm", "--force", name)
 
 
 def test_container_names_are_unique(tmp_path: Path) -> None:
@@ -201,7 +367,8 @@ def test_container_names_are_unique(tmp_path: Path) -> None:
     runner.execute(tmp_path.resolve(), command)
     runner.execute(tmp_path.resolve(), command)
 
-    names = [call[call.index("--name") + 1] for call in (adapter.calls[0], adapter.calls[5])]
+    calls = adapter.container_calls
+    names = [call[call.index("--name") + 1] for call in (calls[0], calls[5])]
     assert names[0] != names[1]
 
 
@@ -222,7 +389,7 @@ def test_cleanup_occurs_for_every_completed_pytest_exit(tmp_path: Path, wait_cod
     )
 
     assert result.exit_code == wait_code
-    assert adapter.calls[-1][:2] == ("rm", "--force")
+    assert adapter.container_calls[-1][:2] == ("rm", "--force")
 
 
 @pytest.mark.parametrize(
@@ -247,14 +414,23 @@ def test_cleanup_after_post_creation_runner_failure(
         SandboxRunner(adapter, clock=FakeClock([0.0, 0.1])).execute(
             tmp_path.resolve(), ("python", "-m", "pytest")
         )
-    assert adapter.calls[-1][:2] == ("rm", "--force")
+    assert adapter.container_calls[-1][:2] == ("rm", "--force")
+
+
+def test_unexpected_runner_exception_after_creation_still_cleans_up(tmp_path: Path) -> None:
+    adapter = FakeDockerAdapter([completed(), RuntimeError("injected runner crash"), completed()])
+    with pytest.raises(RuntimeError, match="injected runner crash"):
+        SandboxRunner(adapter).execute(tmp_path.resolve(), ("python", "-m", "pytest"))
+    create = adapter.container_calls[0]
+    name = create[create.index("--name") + 1]
+    assert adapter.container_calls[-1] == ("rm", "--force", name)
 
 
 def test_create_failure_still_attempts_exact_cleanup(tmp_path: Path) -> None:
     adapter = FakeDockerAdapter([DockerCommandError("create failed"), completed()])
     with pytest.raises(SandboxExecutionError):
         SandboxRunner(adapter).execute(tmp_path.resolve(), ("python", "-m", "pytest"))
-    assert adapter.calls[-1][:2] == ("rm", "--force")
+    assert adapter.container_calls[-1][:2] == ("rm", "--force")
 
 
 def test_cleanup_failure_is_not_hidden(tmp_path: Path) -> None:
@@ -305,12 +481,12 @@ def test_custom_limits_map_to_create_and_wait_deadline(tmp_path: Path) -> None:
     SandboxRunner(adapter, clock=FakeClock([0.0, 0.1])).execute(
         tmp_path.resolve(), ("python", "-m", "pytest"), limits
     )
-    create = adapter.calls[0]
+    create = adapter.container_calls[0]
     assert create[create.index("--cpus") + 1] == "0.5"
     assert create[create.index("--memory") + 1] == "64000000"
     assert create[create.index("--pids-limit") + 1] == "12"
     assert "max-size=300b" in create
-    assert adapter.options[1] == (2.5, 100, 200)
+    assert adapter.options[2] == (2.5, 100, 200)
 
 
 def test_timeout_kills_exact_container_and_returns_typed_result(tmp_path: Path) -> None:
@@ -327,11 +503,12 @@ def test_timeout_kills_exact_container_and_returns_typed_result(tmp_path: Path) 
     result = SandboxRunner(adapter, clock=FakeClock([1.0, 1.5])).execute(
         tmp_path.resolve(), ("python", "-m", "pytest"), SandboxLimits(timeout_seconds=0.1)
     )
-    name = adapter.calls[0][adapter.calls[0].index("--name") + 1]
+    calls = adapter.container_calls
+    name = calls[0][calls[0].index("--name") + 1]
     assert result.completion is SandboxCompletion.TIMED_OUT
     assert result.exit_code is None
-    assert ("kill", "--signal", "KILL", name) in adapter.calls
-    assert adapter.calls[-1] == ("rm", "--force", name)
+    assert ("kill", "--signal", "KILL", name) in calls
+    assert calls[-1] == ("rm", "--force", name)
 
 
 def test_timeout_race_maps_natural_completion_without_kill(tmp_path: Path) -> None:
@@ -350,7 +527,7 @@ def test_timeout_race_maps_natural_completion_without_kill(tmp_path: Path) -> No
     )
     assert result.completion is SandboxCompletion.NORMAL
     assert result.exit_code == 1
-    assert not any(call[0] == "kill" for call in adapter.calls)
+    assert not any(call[0] == "kill" for call in adapter.container_calls)
 
 
 def test_oom_requires_inspection_evidence(tmp_path: Path) -> None:
