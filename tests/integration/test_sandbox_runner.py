@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from app.sandbox.results import TRUNCATION_MARKER, SandboxCompletion, SandboxLimits
 from app.sandbox.runner import (
     CONTAINER_NAME_PREFIX,
     SANDBOX_IMAGE,
@@ -88,6 +89,7 @@ def test_controls_and_output():
     )
 
     assert result.exit_code == 0
+    assert result.completion is SandboxCompletion.NORMAL
     assert "1 passed" in result.stdout
     assert result.stderr == ""
     assert result.duration_seconds >= 0.0
@@ -113,6 +115,7 @@ def test_failure():
     )
 
     assert result.exit_code != 0
+    assert result.completion is SandboxCompletion.NORMAL
     assert "failure-stdout-marker" in result.stdout
     assert "failure-stderr-marker" in result.stdout
     assert isinstance(result.stderr, str)
@@ -134,3 +137,75 @@ def test_approved_command_is_immutable() -> None:
     command = PytestCommand(("python", "-m", "pytest"))
     with pytest.raises(AttributeError):
         command.tokens = ("sh",)
+
+
+def test_infinite_workload_times_out_and_cleans_up(tmp_path: Path) -> None:
+    _write_repository(tmp_path, "def test_forever():\n    while True:\n        pass\n")
+    before = _containers()
+    result = SandboxRunner(SubprocessDockerCommandAdapter()).execute(
+        tmp_path.resolve(), ("python", "-m", "pytest"), SandboxLimits(timeout_seconds=1.0)
+    )
+    assert result.completion is SandboxCompletion.TIMED_OUT
+    assert result.exit_code is None
+    assert result.duration_seconds < 5.0
+    assert _containers() == before
+
+
+def test_memory_exhaustion_is_classified_from_docker_state(tmp_path: Path) -> None:
+    _write_repository(
+        tmp_path,
+        "def test_memory():\n    blocks = []\n    while True:\n        blocks.append(bytearray(1024 * 1024))\n",
+    )
+    before = _containers()
+    result = SandboxRunner(SubprocessDockerCommandAdapter()).execute(
+        tmp_path.resolve(),
+        ("python", "-m", "pytest"),
+        SandboxLimits(memory_bytes=64 * 1024 * 1024, timeout_seconds=10.0),
+    )
+    assert result.completion is SandboxCompletion.MEMORY_LIMIT
+    assert _containers() == before
+
+
+def test_pid_limit_bounds_child_creation(tmp_path: Path) -> None:
+    _write_repository(
+        tmp_path,
+        """import subprocess
+import sys
+
+def test_process_bound():
+    children = []
+    try:
+        for _ in range(64):
+            children.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(5)']))
+    except OSError:
+        pass
+    finally:
+        for child in children:
+            child.kill()
+    assert len(children) < 64
+""",
+    )
+    result = SandboxRunner(SubprocessDockerCommandAdapter()).execute(
+        tmp_path.resolve(), ("python", "-m", "pytest"), SandboxLimits(pids_limit=16)
+    )
+    assert result.completion is SandboxCompletion.NORMAL
+    assert result.exit_code == 0
+
+
+def test_stdout_and_stderr_are_independently_truncated(tmp_path: Path) -> None:
+    _write_repository(tmp_path, "def test_output():\n    pass\n")
+    (tmp_path / "conftest.py").write_text(
+        "import os\ndef pytest_unconfigure(config):\n"
+        "    os.write(1, b'x' * 10000)\n    os.write(2, b'y' * 10000)\n",
+        encoding="utf-8",
+    )
+    limits = SandboxLimits(stdout_bytes=256, stderr_bytes=192)
+    result = SandboxRunner(SubprocessDockerCommandAdapter()).execute(
+        tmp_path.resolve(), ("python", "-m", "pytest"), limits
+    )
+    assert result.stdout_truncated
+    assert result.stderr_truncated
+    assert result.stdout.endswith(TRUNCATION_MARKER.decode())
+    assert result.stderr.endswith(TRUNCATION_MARKER.decode())
+    assert len(result.stdout.encode()) <= limits.stdout_bytes
+    assert len(result.stderr.encode()) <= limits.stderr_bytes

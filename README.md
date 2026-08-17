@@ -2,7 +2,7 @@
 
 TraceFix is planned as a repair agent for diagnosing failures, proposing constrained patches,
 and evaluating them safely. The current repository contains its typed core schemas, a
-deterministic five-case development benchmark, and a basic typed Docker execution boundary for
+deterministic five-case development benchmark, and a resource-bounded typed Docker execution boundary for
 strictly validated pytest commands. Repair, command-line, model, and evaluation behavior remain
 deferred to later tasks.
 
@@ -74,11 +74,20 @@ shown above. CI builds the image first, so integration tests must execute there.
 Each execution uses a fresh, uniquely named Linux container. The prepared repository is the only
 host bind mount and is mounted read-only; the runner copies it into a fresh writable container
 workspace. The container runs as numeric non-root UID/GID `10001:10001`, with networking disabled
-and a read-only root filesystem. The runner captures pytest stdout, stderr, exit code, and
-monotonic duration, then removes the exact generated container after success or failure.
+and a read-only root filesystem. The runner applies typed immutable defaults of 1 CPU, 512 MiB
+memory, 128 processes, a 120-second host deadline, and independent 1 MiB returned stdout and
+stderr limits. Callers customize them by passing a strict `SandboxLimits` instance. Docker uses a
+bounded aggregate local log; the adapter retains each returned stream independently within its
+configured in-memory cap.
 
-This is the bounded Task 0.1.3a sandbox, not final hardening. CPU, memory, PID, wall-clock, and
-output limits remain deferred to Task 0.1.3b. Capability dropping, `no-new-privileges`, explicit
+Results classify normal completion, host wall-clock timeout, and Docker-confirmed OOM termination.
+An ordinary nonzero pytest exit remains normal completion. A truncated stream ends with the fixed
+ASCII marker `[tracefix output truncated]`, and its complete UTF-8 encoding including that marker
+never exceeds its byte limit. The exact generated container is forcibly terminated on timeout and
+removed after every outcome.
+
+This is the Task 0.1.3b resource-bounded sandbox, not final hardening. Capability dropping,
+`no-new-privileges`, explicit
 seccomp selection, sensitive-host-path policy, and the full adversarial suite remain deferred to
 Task 0.1.3c. TraceFix still contains no graph, model provider, API, database, queue, GitHub
 integration, observability service, or production repair workflow.

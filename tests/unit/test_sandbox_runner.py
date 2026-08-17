@@ -6,9 +6,11 @@ from pathlib import Path
 
 import pytest
 
+from app.sandbox.results import TRUNCATION_MARKER, SandboxCompletion, SandboxLimits
 from app.sandbox.runner import (
     DockerCommandError,
     DockerCommandResult,
+    DockerCommandTimeout,
     PytestCommand,
     SandboxCleanupError,
     SandboxExecutionError,
@@ -21,9 +23,19 @@ class FakeDockerAdapter:
     def __init__(self, responses: Sequence[DockerCommandResult | Exception] = ()) -> None:
         self.responses = list(responses)
         self.calls: list[tuple[str, ...]] = []
+        self.options: list[tuple[float | None, int, int]] = []
 
-    def run(self, arguments: Sequence[str]) -> DockerCommandResult:
+    def run(
+        self,
+        arguments: Sequence[str],
+        *,
+        timeout_seconds: float | None = None,
+        stdout_bytes: int = 65_536,
+        stderr_bytes: int = 65_536,
+        check: bool = True,
+    ) -> DockerCommandResult:
         self.calls.append(tuple(arguments))
+        self.options.append((timeout_seconds, stdout_bytes, stderr_bytes))
         if not self.responses:
             raise AssertionError("unexpected Docker call")
         response = self.responses.pop(0)
@@ -42,6 +54,12 @@ class FakeClock:
 
 def completed(exit_code: int = 0, stdout: bytes = b"", stderr: bytes = b"") -> DockerCommandResult:
     return DockerCommandResult(exit_code=exit_code, stdout=stdout, stderr=stderr)
+
+
+def state(*, oom: bool = False, running: bool = False) -> DockerCommandResult:
+    return completed(
+        stdout=f'{{"OOMKilled":{str(oom).lower()},"Running":{str(running).lower()}}}\n'.encode()
+    )
 
 
 @pytest.mark.parametrize(
@@ -138,9 +156,9 @@ def test_constructs_fixed_container_and_maps_result(tmp_path: Path) -> None:
     adapter = FakeDockerAdapter(
         [
             completed(),
-            completed(),
-            completed(stdout=b"1\n"),
             completed(stdout=b"out\xff", stderr=b"err"),
+            completed(stdout=b"1\n"),
+            state(),
             completed(),
         ]
     )
@@ -169,14 +187,14 @@ def test_constructs_fixed_container_and_maps_result(tmp_path: Path) -> None:
     assert mount == f"type=bind,source={tmp_path.resolve()},target=/tracefix/input,readonly"
     assert "type=tmpfs,destination=/tracefix/workspace,tmpfs-mode=1777" in create
     assert "type=tmpfs,destination=/tmp,tmpfs-mode=1777" in create
-    assert adapter.calls[1] == ("start", name)
+    assert adapter.calls[1] == ("start", "--attach", name)
     assert adapter.calls[2] == ("wait", name)
-    assert adapter.calls[3] == ("logs", name)
+    assert adapter.calls[3][:2] == ("inspect", "--format")
     assert adapter.calls[4] == ("rm", "--force", name)
 
 
 def test_container_names_are_unique(tmp_path: Path) -> None:
-    responses = [completed(), completed(), completed(stdout=b"0\n"), completed(), completed()] * 2
+    responses = [completed(), completed(), completed(stdout=b"0\n"), state(), completed()] * 2
     adapter = FakeDockerAdapter(responses)
     runner = SandboxRunner(adapter, clock=FakeClock([0.0, 0.0, 0.0, 0.0]))
     command = ("python", "-m", "pytest")
@@ -194,6 +212,7 @@ def test_cleanup_occurs_for_every_completed_pytest_exit(tmp_path: Path, wait_cod
             completed(),
             completed(),
             completed(stdout=f"{wait_code}\n".encode()),
+            state(),
             completed(),
             completed(),
         ]
@@ -215,7 +234,7 @@ def test_cleanup_occurs_for_every_completed_pytest_exit(tmp_path: Path, wait_cod
             completed(),
             completed(),
             completed(stdout=b"0\n"),
-            DockerCommandError("logs failed"),
+            DockerCommandError("inspect failed"),
             completed(),
         ],
     ],
@@ -244,7 +263,7 @@ def test_cleanup_failure_is_not_hidden(tmp_path: Path) -> None:
             completed(),
             completed(),
             completed(stdout=b"0\n"),
-            completed(),
+            state(),
             DockerCommandError("remove failed"),
         ]
     )
@@ -269,3 +288,103 @@ def test_execution_and_cleanup_failures_preserve_both_facts(tmp_path: Path) -> N
 def test_subprocess_adapter_contract_does_not_expose_completed_process() -> None:
     result = DockerCommandResult(exit_code=0, stdout=b"", stderr=b"")
     assert not isinstance(result, subprocess.CompletedProcess)
+
+
+def test_custom_limits_map_to_create_and_wait_deadline(tmp_path: Path) -> None:
+    limits = SandboxLimits(
+        cpu_count=0.5,
+        memory_bytes=64_000_000,
+        pids_limit=12,
+        timeout_seconds=2.5,
+        stdout_bytes=100,
+        stderr_bytes=200,
+    )
+    adapter = FakeDockerAdapter(
+        [completed(), completed(), completed(stdout=b"0\n"), state(), completed()]
+    )
+    SandboxRunner(adapter, clock=FakeClock([0.0, 0.1])).execute(
+        tmp_path.resolve(), ("python", "-m", "pytest"), limits
+    )
+    create = adapter.calls[0]
+    assert create[create.index("--cpus") + 1] == "0.5"
+    assert create[create.index("--memory") + 1] == "64000000"
+    assert create[create.index("--pids-limit") + 1] == "12"
+    assert "max-size=300b" in create
+    assert adapter.options[1] == (2.5, 100, 200)
+
+
+def test_timeout_kills_exact_container_and_returns_typed_result(tmp_path: Path) -> None:
+    adapter = FakeDockerAdapter(
+        [
+            completed(),
+            DockerCommandTimeout("deadline", result=completed(stdout=b"partial")),
+            state(running=True),
+            completed(),
+            state(),
+            completed(),
+        ]
+    )
+    result = SandboxRunner(adapter, clock=FakeClock([1.0, 1.5])).execute(
+        tmp_path.resolve(), ("python", "-m", "pytest"), SandboxLimits(timeout_seconds=0.1)
+    )
+    name = adapter.calls[0][adapter.calls[0].index("--name") + 1]
+    assert result.completion is SandboxCompletion.TIMED_OUT
+    assert result.exit_code is None
+    assert ("kill", "--signal", "KILL", name) in adapter.calls
+    assert adapter.calls[-1] == ("rm", "--force", name)
+
+
+def test_timeout_race_maps_natural_completion_without_kill(tmp_path: Path) -> None:
+    adapter = FakeDockerAdapter(
+        [
+            completed(),
+            DockerCommandTimeout("deadline", result=completed()),
+            state(running=False),
+            completed(stdout=b"1\n"),
+            state(),
+            completed(),
+        ]
+    )
+    result = SandboxRunner(adapter, clock=FakeClock([1.0, 1.1])).execute(
+        tmp_path.resolve(), ("python", "-m", "pytest"), SandboxLimits(timeout_seconds=0.1)
+    )
+    assert result.completion is SandboxCompletion.NORMAL
+    assert result.exit_code == 1
+    assert not any(call[0] == "kill" for call in adapter.calls)
+
+
+def test_oom_requires_inspection_evidence(tmp_path: Path) -> None:
+    adapter = FakeDockerAdapter(
+        [
+            completed(),
+            completed(),
+            completed(stdout=b"137\n"),
+            state(oom=True),
+            completed(),
+            completed(),
+        ]
+    )
+    result = SandboxRunner(adapter, clock=FakeClock([0.0, 0.2])).execute(
+        tmp_path.resolve(), ("python", "-m", "pytest")
+    )
+    assert result.completion is SandboxCompletion.MEMORY_LIMIT
+    assert result.exit_code == 137
+
+
+@pytest.mark.parametrize(
+    ("payload", "limit", "expected_truncated"),
+    [
+        (b"abc", 32, False),
+        (b"a" * 32, 32, False),
+        (b"a" * 33, 32, True),
+        (("a€" + "z" * 40).encode(), len(TRUNCATION_MARKER) + 2, True),
+        (b"a\xffb" * 20, 32, True),
+    ],
+)
+def test_output_bounding_is_byte_safe(payload: bytes, limit: int, expected_truncated: bool) -> None:
+    from app.sandbox.runner import _bounded_text
+
+    text, truncated = _bounded_text(payload, limit)
+    assert truncated is expected_truncated
+    assert len(text.encode("utf-8")) <= limit
+    assert text.endswith(TRUNCATION_MARKER.decode()) is expected_truncated
