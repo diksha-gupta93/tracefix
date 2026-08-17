@@ -49,7 +49,17 @@ def _containers() -> set[str]:
 def _write_repository(repository: Path, test_source: str) -> None:
     tests = repository / "tests"
     tests.mkdir(parents=True)
-    (tests / "test_sandbox.py").write_text(test_source, encoding="utf-8")
+    test_file = tests / "test_sandbox.py"
+    test_file.write_text(test_source, encoding="utf-8")
+
+    # Native Linux preserves host ownership and modes for bind mounts. Pytest's
+    # per-test temporary directory is private to the host runner by default, so
+    # the sandbox's fixed non-root user otherwise cannot traverse the prepared
+    # repository mounted at /tracefix/input. These permissions expose only the
+    # synthetic repository; the bind mount remains read-only in the container.
+    repository.chmod(0o755)
+    tests.chmod(0o755)
+    test_file.chmod(0o644)
 
 
 def test_passing_pytest_observes_required_container_controls(tmp_path: Path) -> None:
