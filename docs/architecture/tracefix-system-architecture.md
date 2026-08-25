@@ -855,6 +855,18 @@ seccomp=unconfined
 
 The initial implementation should not introduce an unnecessarily restrictive custom Python syscall allowlist.
 
+### Host Platform Security Boundary
+
+Linux is the production-supported host platform for preparing and executing adversarial
+repositories. Its preparation boundary uses directory-relative filesystem primitives to prevent
+workspace-root replacement from redirecting writes outside the approved workspace.
+
+Native Windows remains supported for development and functional validation, including preparation,
+fingerprinting, and Linux-container execution through Docker Desktop. It is not claimed as a
+production-grade host filesystem security boundary when complete elimination of workspace-root
+TOCTOU races is required. Running the execution container on Linux through Docker Desktop does not
+strengthen the native Windows host-side preparation boundary.
+
 ### Suggested Initial Resource Limits
 
 ```text

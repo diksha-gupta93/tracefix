@@ -1,7 +1,8 @@
 | Task name | Specification name | Branch name | Status |
 | --- | --- | --- | --- |
-| Task 0.1.3c — Security Hardening and Adversarial Tests | `docs/specs/0.1-003c-security-hardening.md` | current working branch | Completed; sandbox image built; 243 passed, 3 platform skips; format, lint, strict typing, and 11 Docker integration tests passed |
-| Task 0.1.3b — Resource, Timeout, and Output Enforcement | `docs/specs/0.1-003b-resource-timeout-enforcement.md` | current working branch | Completed; sandbox image built; 226 passed, 2 platform skips; format, lint, strict typing, and 8 Docker integration tests passed |
+| Task 0.1.4 — Prepare Repository and Run Baseline Nodes | `docs/specs/0.1-004-prepare-and-baseline.md` | `task/0.1.4-prepare-and-baseline` | Completed; sandbox image built; 286 passed, 11 platform-capability skips; format, lint, strict typing, 16 Docker integration tests, and 23 Linux preparation tests including two adversarial TOCTOU regressions passed |
+| Task 0.1.3c — Security Hardening and Adversarial Tests | `docs/specs/0.1-003c-security-hardening.md` | `task/0.1.3c-security-hardening` | Completed; sandbox image built; 243 passed, 3 platform skips; format, lint, strict typing, and 11 Docker integration tests passed |
+| Task 0.1.3b — Resource, Timeout, and Output Enforcement | `docs/specs/0.1-003b-resource-timeout-enforcement.md` | `task/0.1.3b-resource-timeout-enforcement` | Completed; sandbox image built; 226 passed, 2 platform skips; format, lint, strict typing, and 8 Docker integration tests passed |
 | Task 0.1.3a — Basic Docker Execution | `docs/specs/0.1-003a-basic-docker-execution.md` | `task/0.1.3a-basic-docker` | Completed; sandbox image built; 174 passed, 2 platform skips; format, lint, strict typing, and 4 Docker integration tests passed |
 | Task 0.1.2 — Fixture Repository | `docs/specs/0.1-002-fixture-defects.md` | `task/0.1.2-fixture-defects` | Completed; 115 passed, 1 platform skip; format, lint, and strict typing passed |
 | Task 0.1.0 — Repository Bootstrap | `docs/specs/0.1-000-bootstrap.md` | `task/0.1.0-bootstrap` | Completed |

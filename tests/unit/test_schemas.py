@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from math import inf, nan
+from pathlib import Path
 
 import pytest
 from pydantic import BaseModel, ValidationError
 
 from app.agent.schemas import (
+    BaselineDiagnosticCode,
+    BaselineEvidence,
+    BaselineOutcome,
+    BaselineResult,
     EvaluationResult,
     EvaluationStatus,
     FailureAnalysis,
@@ -15,6 +21,9 @@ from app.agent.schemas import (
     PatchProposal,
     RepairPlan,
     RepairStatus,
+    RepositoryFingerprint,
+    RepositoryPreparation,
+    RevisionKind,
 )
 from app.agent.schemas import (
     TestResult as SchemaTestResult,
@@ -22,6 +31,7 @@ from app.agent.schemas import (
 from app.agent.schemas import (
     TestStatus as SchemaTestStatus,
 )
+from app.sandbox import SandboxCompletion
 
 
 def make_test_result() -> SchemaTestResult:
@@ -365,3 +375,155 @@ def test_assignment_validation_rejects_invalid_updates() -> None:
         state.attempt_number = 2
     with pytest.raises(ValidationError):
         result.duration_seconds = -1.0
+
+
+def test_baseline_schema_is_frozen_strict_and_state_compatible(tmp_path: Path) -> None:
+    preparation = RepositoryPreparation(
+        case_id="case",
+        requested_revision="case-failing-v1",
+        revision_kind=RevisionKind.SNAPSHOT,
+        prepared_repository=tmp_path.resolve(),
+        fingerprint=RepositoryFingerprint(digest="a" * 64),
+    )
+    evidence = BaselineEvidence(
+        completion=SandboxCompletion.NORMAL,
+        exit_code=0,
+        stdout="passed",
+        stderr="",
+        stdout_truncated=False,
+        stderr_truncated=False,
+        duration_seconds=0.1,
+    )
+    baseline = BaselineResult(
+        preparation=preparation,
+        outcome=BaselineOutcome.NOT_REPRODUCIBLE,
+        evidence=evidence,
+        diagnostic_code=BaselineDiagnosticCode.BASELINE_NOT_REPRODUCIBLE,
+        message="failure did not reproduce",
+    )
+    state = LocalRepairCaseState(case_id="case", baseline_result=baseline)
+    assert BaselineResult.model_validate_json(baseline.model_dump_json()) == baseline
+    assert state.baseline_result == baseline
+    with pytest.raises(ValidationError):
+        RepositoryFingerprint(digest="invalid")
+    with pytest.raises(ValidationError):
+        baseline.message = "changed"
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"terminal": False},
+        {"diagnostic_code": BaselineDiagnosticCode.SANDBOX_TIMED_OUT},
+        {"evidence": None},
+        {
+            "outcome": BaselineOutcome.INFRASTRUCTURE_DIAGNOSTIC,
+            "diagnostic_code": BaselineDiagnosticCode.BASELINE_NOT_REPRODUCIBLE,
+        },
+    ],
+)
+def test_baseline_schema_rejects_inconsistent_terminal_diagnostics(
+    tmp_path: Path, changes: dict[str, object]
+) -> None:
+    preparation = RepositoryPreparation(
+        case_id="case",
+        requested_revision="case-failing-v1",
+        revision_kind=RevisionKind.SNAPSHOT,
+        prepared_repository=tmp_path.resolve(),
+        fingerprint=RepositoryFingerprint(digest="a" * 64),
+    )
+    evidence = BaselineEvidence(
+        completion=SandboxCompletion.NORMAL,
+        exit_code=0,
+        stdout="passed",
+        stderr="",
+        stdout_truncated=False,
+        stderr_truncated=False,
+        duration_seconds=0.1,
+    )
+    values: dict[str, object] = {
+        "preparation": preparation,
+        "outcome": BaselineOutcome.NOT_REPRODUCIBLE,
+        "evidence": evidence,
+        "diagnostic_code": BaselineDiagnosticCode.BASELINE_NOT_REPRODUCIBLE,
+        "message": "failure did not reproduce",
+    }
+    values.update(changes)
+    with pytest.raises(ValidationError):
+        BaselineResult.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "code", "completion", "exit_code", "evidence_required"),
+    [
+        (BaselineOutcome.REPRODUCED_FAILURE, None, SandboxCompletion.TIMED_OUT, None, True),
+        (BaselineOutcome.REPRODUCED_FAILURE, None, SandboxCompletion.NORMAL, 0, True),
+        (
+            BaselineOutcome.NOT_REPRODUCIBLE,
+            BaselineDiagnosticCode.BASELINE_NOT_REPRODUCIBLE,
+            SandboxCompletion.NORMAL,
+            1,
+            True,
+        ),
+        (
+            BaselineOutcome.NOT_REPRODUCIBLE,
+            BaselineDiagnosticCode.BASELINE_NOT_REPRODUCIBLE,
+            SandboxCompletion.MEMORY_LIMIT,
+            None,
+            True,
+        ),
+        (
+            BaselineOutcome.INFRASTRUCTURE_DIAGNOSTIC,
+            BaselineDiagnosticCode.SANDBOX_TIMED_OUT,
+            SandboxCompletion.NORMAL,
+            0,
+            True,
+        ),
+        (
+            BaselineOutcome.INFRASTRUCTURE_DIAGNOSTIC,
+            BaselineDiagnosticCode.SANDBOX_MEMORY_LIMIT,
+            SandboxCompletion.TIMED_OUT,
+            None,
+            True,
+        ),
+        (
+            BaselineOutcome.INFRASTRUCTURE_DIAGNOSTIC,
+            BaselineDiagnosticCode.SANDBOX_EXECUTION_FAILED,
+            SandboxCompletion.NORMAL,
+            1,
+            True,
+        ),
+    ],
+)
+def test_baseline_schema_rejects_contradictory_serialized_evidence(
+    tmp_path: Path,
+    outcome: BaselineOutcome,
+    code: BaselineDiagnosticCode | None,
+    completion: SandboxCompletion,
+    exit_code: int | None,
+    evidence_required: bool,
+) -> None:
+    del evidence_required
+    values = {
+        "preparation": {
+            "case_id": "case",
+            "requested_revision": "case-failing-v1",
+            "revision_kind": "snapshot",
+            "prepared_repository": str(tmp_path.resolve()),
+            "fingerprint": {"digest": "a" * 64},
+        },
+        "outcome": outcome,
+        "evidence": {
+            "completion": completion,
+            "exit_code": exit_code,
+            "stdout": "",
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "duration_seconds": 0.1,
+        },
+        "diagnostic_code": code,
+        "message": None if outcome is BaselineOutcome.REPRODUCED_FAILURE else "diagnostic",
+    }
+    with pytest.raises(ValidationError):
+        BaselineResult.model_validate_json(json.dumps(values, default=str))

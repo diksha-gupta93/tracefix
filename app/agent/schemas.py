@@ -2,9 +2,20 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated
+from pathlib import Path
+from typing import Annotated, Literal
 
-from pydantic import AwareDatetime, BaseModel, BeforeValidator, ConfigDict, Field, StringConstraints
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
+
+from app.sandbox.results import SandboxCompletion
 
 NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 StrictInteger = Annotated[int, Field(strict=True)]
@@ -58,6 +69,115 @@ class FailureCategory(StrEnum):
 class EvaluationStatus(StrEnum):
     passed = "passed"
     failed = "failed"
+
+
+class RevisionKind(StrEnum):
+    SNAPSHOT = "snapshot"
+
+
+class BaselineOutcome(StrEnum):
+    REPRODUCED_FAILURE = "reproduced_failure"
+    NOT_REPRODUCIBLE = "baseline_not_reproducible"
+    INFRASTRUCTURE_DIAGNOSTIC = "infrastructure_diagnostic"
+
+
+class BaselineDiagnosticCode(StrEnum):
+    BASELINE_NOT_REPRODUCIBLE = "baseline_not_reproducible"
+    INVALID_VISIBLE_TEST = "invalid_visible_test"
+    SANDBOX_TIMED_OUT = "sandbox_timed_out"
+    SANDBOX_MEMORY_LIMIT = "sandbox_memory_limit"
+    SANDBOX_VALIDATION_FAILED = "sandbox_validation_failed"
+    SANDBOX_EXECUTION_FAILED = "sandbox_execution_failed"
+    SANDBOX_CLEANUP_FAILED = "sandbox_cleanup_failed"
+    MALFORMED_SANDBOX_RESULT = "malformed_sandbox_result"
+
+
+class RepositoryFingerprint(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    algorithm: Annotated[str, Field(pattern=r"^sha256$")] = "sha256"
+    version: Annotated[int, Field(strict=True, ge=1, le=1)] = 1
+    digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+    @property
+    def identifier(self) -> str:
+        return f"tracefix-repository-{self.algorithm}-v{self.version}:{self.digest}"
+
+
+class RepositoryPreparation(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    case_id: NonBlankString
+    requested_revision: NonBlankString
+    revision_kind: RevisionKind
+    prepared_repository: Path
+    fingerprint: RepositoryFingerprint
+
+
+class BaselineEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    completion: SandboxCompletion
+    exit_code: StrictInteger | None
+    stdout: str
+    stderr: str
+    stdout_truncated: Annotated[bool, Field(strict=True)]
+    stderr_truncated: Annotated[bool, Field(strict=True)]
+    duration_seconds: NonNegativeFiniteFloat
+
+
+class BaselineResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    preparation: RepositoryPreparation
+    outcome: BaselineOutcome
+    evidence: BaselineEvidence | None
+    diagnostic_code: BaselineDiagnosticCode | None = None
+    message: NonBlankString | None = None
+    terminal: Literal[True] = True
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> BaselineResult:
+        if self.outcome is BaselineOutcome.REPRODUCED_FAILURE:
+            if (
+                self.evidence is None
+                or self.evidence.completion is not SandboxCompletion.NORMAL
+                or self.evidence.exit_code in (None, 0)
+                or self.diagnostic_code is not None
+                or self.message is not None
+            ):
+                raise ValueError("reproduced failure requires evidence without a diagnostic")
+        elif self.outcome is BaselineOutcome.NOT_REPRODUCIBLE:
+            if (
+                self.evidence is None
+                or self.evidence.completion is not SandboxCompletion.NORMAL
+                or self.evidence.exit_code != 0
+                or self.diagnostic_code is not BaselineDiagnosticCode.BASELINE_NOT_REPRODUCIBLE
+                or self.message is None
+            ):
+                raise ValueError("non-reproducible baseline requires complete pass evidence")
+        elif (
+            self.diagnostic_code is None
+            or self.diagnostic_code is BaselineDiagnosticCode.BASELINE_NOT_REPRODUCIBLE
+            or self.message is None
+        ):
+            raise ValueError("infrastructure diagnostic requires a matching code and message")
+        elif self.diagnostic_code is BaselineDiagnosticCode.SANDBOX_TIMED_OUT:
+            if (
+                self.evidence is None
+                or self.evidence.completion is not SandboxCompletion.TIMED_OUT
+                or self.evidence.exit_code is not None
+            ):
+                raise ValueError("timeout diagnostic requires timed-out evidence")
+        elif self.diagnostic_code is BaselineDiagnosticCode.SANDBOX_MEMORY_LIMIT:
+            if (
+                self.evidence is None
+                or self.evidence.completion is not SandboxCompletion.MEMORY_LIMIT
+            ):
+                raise ValueError("memory-limit diagnostic requires memory-limit evidence")
+        elif self.evidence is not None:
+            raise ValueError("non-execution diagnostic cannot contain execution evidence")
+        return self
 
 
 class TestResult(BaseModel):
@@ -118,7 +238,7 @@ class LocalRepairCaseState(BaseModel):
     status: RepairStatus = RepairStatus.pending
     attempt_number: Annotated[int, Field(strict=True, ge=0, le=1)] = 0
     max_attempts: Annotated[int, Field(strict=True, ge=1, le=1)] = 1
-    baseline_result: TestResult | None = None
+    baseline_result: TestResult | BaselineResult | None = None
     failure_analysis: FailureAnalysis | None = None
     repair_plan: RepairPlan | None = None
     candidate_patch: PatchProposal | None = None
