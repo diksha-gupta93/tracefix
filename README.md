@@ -2,15 +2,17 @@
 
 TraceFix is an in-progress autonomous code-repair and evaluation platform for failing Python
 repositories. Its current foundation prepares deterministic benchmark snapshots, fingerprints their
-contents, and reproduces known failures inside a hardened Docker sandbox. Typed Pydantic state and
-explicit outcome classification provide the contracts for the repair workflow that follows.
+contents, reproduces known failures inside a hardened Docker sandbox, classifies captured
+pytest/Python evidence deterministically, and selects bounded model-safe context through static
+text and AST inspection. Typed Pydantic state provides the contracts for the repair workflow that
+follows.
 
 The broader platform will analyze failures, propose bounded patches, verify them, and present the
 result with reproducible evidence. Model-driven repair is not implemented yet.
 
 ## Current Status
 
-The repository has completed the v0.1 foundation through Task 0.1.4:
+The repository has completed the v0.1 foundation through Task 0.1.5:
 
 - Python 3.14 packaging, CI, and deterministic quality tooling
 - strict Pydantic v2 schemas for repair state, results, plans, patches, and evaluations
@@ -23,11 +25,16 @@ The repository has completed the v0.1 foundation through Task 0.1.4:
 - baseline reproduction of each seeded visible failure in the Docker sandbox
 - typed handling of reproduced failures, unexpected passes, timeouts, OOM termination, sandbox
   failures, malformed results, and cleanup failures
+- deterministic runtime failure classification with ambiguity and truncation handled fail-closed
+- immutable, exact-byte-bounded context packages containing relevant visible tests, tracebacks,
+  traceback-referenced source and static definitions/imports/types
+- evaluator, secret-bearing, generated, binary, invalid UTF-8, aliased, stale, and unrelated
+  context exclusion with immutable protected-path metadata
 - adversarial filesystem and sandbox security tests, including Linux TOCTOU regression coverage
 
 [`docs/progress.md`](docs/progress.md) is the source of truth for task completion and recorded
 validation evidence. It currently records no task as in progress. The next planned task in the
-execution plan is Task 0.1.5: failure classification and bounded relevant-context selection.
+execution plan is Task 0.1.6: repair planning and patch generation.
 
 ## Why TraceFix
 
@@ -53,16 +60,18 @@ The intended local repair flow is:
 benchmark case
   -> repository preparation and fingerprinting       [implemented]
   -> baseline failure reproduction                    [implemented]
-  -> failure classification and relevant context      [roadmap]
+  -> failure classification and relevant context      [implemented]
   -> repair planning and patch generation             [roadmap]
   -> patch policy and static validation               [roadmap]
   -> sandbox verification                             [roadmap]
   -> evaluation and routing                           [roadmap]
 ```
 
-The current implementation deliberately stops after producing typed baseline evidence. Later v0.1
-tasks add the local repair pipeline; v0.2 adds persistence, queue-backed workers, API ingress, and
-checkpoint recovery; v1.0 adds GitHub integration, human approval, and production observability.
+The current implementation deliberately stops after producing typed failure analysis and bounded
+static context. It does not call a model, plan a repair, or generate or apply patches. Later v0.1
+tasks add those parts of the local repair pipeline; v0.2 adds persistence, queue-backed workers,
+API ingress, and checkpoint recovery; v1.0 adds GitHub integration, human approval, and production
+observability.
 External systems are designed to sit behind typed adapters, and long-running work will run in
 workers rather than HTTP handlers once those layers exist.
 
@@ -81,15 +90,17 @@ TraceFix can currently:
 - calculate a location-independent, versioned SHA-256 repository fingerprint;
 - execute only validated `python -m pytest` commands for declared visible test paths;
 - retain bounded stdout, stderr, truncation flags, exit status, duration, and completion evidence;
-  and
-- classify a reproduced failure separately from a non-reproducible baseline or infrastructure
-  diagnostic.
+  classify recognized syntax, import, assertion, exception, type, timeout, and environment
+  evidence without using benchmark answers; and
+- produce deterministic context under an exact 32,768-byte default limit while revalidating the
+  prepared fingerprint and evaluator boundary.
 
 Current benchmark revisions are symbolic snapshot identities, not Git commit SHAs. Successful
 prepared workspaces are caller-owned and must be cleaned up after downstream work completes.
 
-TraceFix does not yet generate or apply repairs, call a model provider, execute a LangGraph workflow,
-expose a CLI or API, persist jobs, run a queue, integrate with GitHub, or report repair success rates.
+TraceFix does not yet plan, generate, or apply repairs, call a model provider, execute a LangGraph
+workflow, expose a CLI or API, persist jobs, run a queue, integrate with GitHub, or report repair
+success rates.
 
 ## Quick Start
 

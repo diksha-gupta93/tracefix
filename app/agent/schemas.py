@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
 
 from pydantic import (
@@ -195,6 +195,115 @@ class FailureAnalysis(BaseModel):
 
     category: FailureCategory
     summary: NonBlankString
+
+
+class ContextItemKind(StrEnum):
+    ISSUE = "issue"
+    CLASSIFICATION = "classification"
+    PROTECTED_PATH_POLICY = "protected_path_policy"
+    FAILURE_TRACE = "failure_trace"
+    VISIBLE_TEST = "visible_test"
+    SOURCE = "source"
+    DEFINITION = "definition"
+    IMPORT = "import"
+    TYPE_DEFINITION = "type_definition"
+    REPOSITORY_INSTRUCTION = "repository_instruction"
+
+
+class ContextOmissionReason(StrEnum):
+    BUDGET = "budget"
+    AST_PARSE_FAILED = "ast_parse_failed"
+    GENERATED = "generated"
+    SECRET = "secret"
+    UNSAFE_PATH = "unsafe_path"
+    UNREADABLE = "unreadable"
+    UNRELATED = "unrelated"
+
+
+class ContextItem(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    path: PurePosixPath
+    kind: ContextItemKind
+    content: str
+    priority: Annotated[int, Field(strict=True, ge=0, le=6)]
+    source_line: Annotated[int, Field(strict=True, ge=0)] = 0
+    truncated: Annotated[bool, Field(strict=True)] = False
+    original_utf8_bytes: Annotated[int, Field(strict=True, ge=0)]
+
+    @model_validator(mode="after")
+    def validate_relative_path_and_size(self) -> ContextItem:
+        value = self.path.as_posix()
+        if (
+            self.path.is_absolute()
+            or not value
+            or value == "."
+            or "\\" in value
+            or "\x00" in value
+            or any(part in {"", ".", ".."} for part in self.path.parts)
+        ):
+            raise ValueError("context path must be a normalized relative POSIX path")
+        if self.original_utf8_bytes < len(self.content.encode("utf-8")):
+            raise ValueError("original size cannot be smaller than included content")
+        return self
+
+    def downstream_text(self) -> str:
+        return f"[{self.kind.value}] {self.path.as_posix()}\n{self.content}\n"
+
+
+class ContextOmission(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    path: PurePosixPath
+    kind: ContextItemKind
+    reason: ContextOmissionReason
+
+
+class ProtectedPathPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    protected_paths: tuple[PurePosixPath, ...]
+    exceptions: tuple[PurePosixPath, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_policy(self) -> ProtectedPathPolicy:
+        if not self.protected_paths or self.exceptions:
+            raise ValueError("protected-path policy must be non-empty and grant no exceptions")
+        values = tuple(path.as_posix() for path in self.protected_paths)
+        if values != tuple(sorted(set(values), key=str.casefold)):
+            raise ValueError("protected paths must be unique and deterministically ordered")
+        return self
+
+
+class ContextPackage(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    case_id: NonBlankString
+    failure_analysis: FailureAnalysis
+    protected_path_policy: ProtectedPathPolicy
+    items: tuple[ContextItem, ...]
+    omissions: tuple[ContextOmission, ...] = ()
+    limit_utf8_bytes: Annotated[int, Field(strict=True, gt=0)]
+    actual_utf8_bytes: Annotated[int, Field(strict=True, ge=0)]
+    safe_material_omitted: Annotated[bool, Field(strict=True)]
+
+    def downstream_text(self) -> str:
+        return "".join(item.downstream_text() for item in self.items)
+
+    @model_validator(mode="after")
+    def validate_accounting_and_order(self) -> ContextPackage:
+        actual = len(self.downstream_text().encode("utf-8"))
+        if actual != self.actual_utf8_bytes or actual > self.limit_utf8_bytes:
+            raise ValueError("context UTF-8 accounting is invalid")
+        order = tuple(
+            (item.priority, item.path.as_posix().casefold(), item.source_line, item.kind.value)
+            for item in self.items
+        )
+        if order != tuple(sorted(order)):
+            raise ValueError("context items are not deterministically ordered")
+        if self.safe_material_omitted != bool(self.omissions):
+            raise ValueError("omission flag does not match omission metadata")
+        return self
 
 
 class RepairPlan(BaseModel):
