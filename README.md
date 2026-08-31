@@ -190,9 +190,9 @@ real-model benchmark execution exists.
 
 ## Roadmap
 
-- **Remaining v0.1:** classify failures, select bounded context, plan and generate patches, enforce
-  patch policy, verify candidates, route outcomes, add a local CLI, and separate deterministic fake
-  model integration from live-model evaluation.
+- **Remaining v0.1:** plan and generate patches, enforce patch policy, verify candidates, route
+  outcomes, add a local CLI, and separate deterministic fake-model integration from live-model
+  evaluation.
 - **v0.2:** add PostgreSQL-backed state, queue workers, FastAPI ingress, LangGraph checkpointing,
   recovery, bounded retries, and expanded evaluation.
 - **v1.0:** add GitHub App workflows, human approval, observability, resilience hardening, and

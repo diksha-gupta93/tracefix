@@ -66,10 +66,11 @@ def test_classifies_runtime_evidence(evidence: str, category: FailureCategory) -
     assert "C:" not in analysis.summary
 
 
-def test_syntax_has_precedence_and_conflicting_non_syntax_signals_are_ambiguous() -> None:
+def test_single_syntax_signal_is_recognized_and_conflicting_signals_are_ambiguous() -> None:
+    assert classify_failure(_result("SyntaxError: bad")).category is FailureCategory.syntax_failure
     assert (
-        classify_failure(_result("SyntaxError: bad\nassert False")).category
-        is FailureCategory.syntax_failure
+        classify_failure(_result("SyntaxError: bad\nE   assert False")).category
+        is FailureCategory.unsupported_or_ambiguous
     )
     assert (
         classify_failure(_result("ModuleNotFoundError: x\nE   assert False")).category
@@ -84,6 +85,79 @@ def test_materially_truncated_evidence_is_ambiguous() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "host_path",
+    [
+        "C:\\Users\\alice\\repo\\test_x.py",
+        "\\\\server\\share\\test_x.py",
+        "\\\\?\\C:\\repo\\test_x.py",
+        "/opt/private/repo/test_x.py",
+    ],
+)
+def test_summary_redacts_cross_platform_absolute_paths(host_path: str) -> None:
+    analysis = classify_failure(_result(f"{host_path}:2:\nE   assert False"))
+    assert analysis.category is FailureCategory.assertion_failure
+    assert host_path not in analysis.summary
+    assert "<host-path>" in analysis.summary
+
+
+@pytest.mark.parametrize(
+    "host_path",
+    [
+        '"C:\\Users\\Alice Smith\\repo\\test_x.py"',
+        '"\\\\server\\shared folder\\test_x.py"',
+        "'/opt/private folder/repo/test_x.py'",
+    ],
+)
+def test_summary_redacts_quoted_absolute_paths_containing_spaces(host_path: str) -> None:
+    analysis = classify_failure(_result(f"File {host_path}, line 2\nE   assert False"))
+    assert analysis.category is FailureCategory.assertion_failure
+    assert host_path.strip("\"'") not in analysis.summary
+    assert "<host-path>" in analysis.summary
+
+
+def test_summary_redacts_recognized_credentials() -> None:
+    analysis = classify_failure(_result("api_key=super-secret-value\nE   assert False"))
+    assert analysis.category is FailureCategory.assertion_failure
+    assert "super-secret-value" not in analysis.summary
+    assert "<redacted-secret>" in analysis.summary
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        'password="top secret value"',
+        "client_secret='another secret value'",
+        'api_key="value#fragment secret"',
+        "-----BEGIN PRIVATE KEY-----\nprivate-material\n-----END PRIVATE KEY-----",
+    ],
+)
+def test_summary_fully_redacts_multiline_and_quoted_secrets(secret: str) -> None:
+    analysis = classify_failure(_result(f"{secret}\nE   assert False"))
+
+    assert analysis.category is FailureCategory.assertion_failure
+    assert secret not in analysis.summary
+    assert "top secret value" not in analysis.summary
+    assert "another secret value" not in analysis.summary
+    assert "PRIVATE KEY" not in analysis.summary
+    assert "private-material" not in analysis.summary
+    assert "<redacted-secret>" in analysis.summary
+
+
+@pytest.mark.parametrize(
+    "near_miss",
+    [
+        "documentation mentions syntax errors",
+        "a module was not found useful",
+        "the operation has a type",
+        "elapsed time was long",
+        "fixture client exists",
+    ],
+)
+def test_category_near_misses_remain_ambiguous(near_miss: str) -> None:
+    assert classify_failure(_result(near_miss)).category is FailureCategory.unsupported_or_ambiguous
+
+
 def test_non_reproduced_result_is_refused() -> None:
     reproduced = _result("assert False")
     result = BaselineResult(
@@ -95,3 +169,104 @@ def test_non_reproduced_result_is_refused() -> None:
     )
     with pytest.raises(ClassificationError, match="baseline_not_reproduced"):
         classify_failure(result)
+
+
+def test_infrastructure_and_malformed_reproduced_results_are_refused() -> None:
+    reproduced = _result("E   assert False")
+    infrastructure = BaselineResult.model_construct(
+        preparation=reproduced.preparation,
+        outcome=BaselineOutcome.INFRASTRUCTURE_DIAGNOSTIC,
+        evidence=reproduced.evidence,
+        terminal=True,
+    )
+    with pytest.raises(ClassificationError, match="baseline_not_reproduced"):
+        classify_failure(infrastructure)
+    malformed = BaselineResult.model_construct(
+        preparation=reproduced.preparation,
+        outcome=BaselineOutcome.REPRODUCED_FAILURE,
+        evidence=None,
+        terminal=True,
+    )
+    with pytest.raises(ClassificationError, match="malformed_baseline"):
+        classify_failure(malformed)
+
+    missing_preparation = BaselineResult.model_construct(
+        outcome=BaselineOutcome.REPRODUCED_FAILURE,
+        evidence=reproduced.evidence,
+        terminal=True,
+    )
+    with pytest.raises(ClassificationError, match="malformed_baseline"):
+        classify_failure(missing_preparation)
+
+    malformed_evidence = BaselineResult.model_construct(
+        preparation=reproduced.preparation,
+        outcome=BaselineOutcome.REPRODUCED_FAILURE,
+        evidence=object(),
+        terminal=True,
+    )
+    with pytest.raises(ClassificationError, match="malformed_baseline"):
+        classify_failure(malformed_evidence)
+
+    contradictory_completion = BaselineResult.model_construct(
+        preparation=reproduced.preparation,
+        outcome=BaselineOutcome.REPRODUCED_FAILURE,
+        evidence=reproduced.evidence.model_copy(update={"completion": SandboxCompletion.TIMED_OUT}),
+        terminal=True,
+    )
+    with pytest.raises(ClassificationError, match="malformed_baseline"):
+        classify_failure(contradictory_completion)
+
+
+@pytest.mark.parametrize(
+    "malformed_evidence",
+    [
+        BaselineEvidence.model_construct(),
+        BaselineEvidence.model_construct(
+            completion=SandboxCompletion.NORMAL,
+            exit_code=1,
+            stdout=1,
+            stderr="",
+            stdout_truncated=False,
+            stderr_truncated=False,
+            duration_seconds=0.1,
+        ),
+        BaselineEvidence.model_construct(
+            completion=SandboxCompletion.NORMAL,
+            exit_code=1,
+            stdout="E   assert False",
+            stderr="",
+            stdout_truncated=False,
+            stderr_truncated=False,
+        ),
+    ],
+)
+def test_malformed_nested_evidence_is_a_typed_failure(
+    malformed_evidence: BaselineEvidence,
+) -> None:
+    reproduced = _result("E   assert False")
+    malformed = BaselineResult.model_construct(
+        preparation=reproduced.preparation,
+        outcome=BaselineOutcome.REPRODUCED_FAILURE,
+        evidence=malformed_evidence,
+        diagnostic_code=None,
+        message=None,
+        terminal=True,
+    )
+
+    with pytest.raises(ClassificationError, match="malformed_baseline"):
+        classify_failure(malformed)
+
+
+def test_malformed_nested_preparation_is_a_typed_failure() -> None:
+    reproduced = _result("E   assert False")
+    malformed = BaselineResult.model_construct(
+        preparation=RepositoryPreparation.model_construct(),
+        outcome=BaselineOutcome.REPRODUCED_FAILURE,
+        evidence=reproduced.evidence,
+        diagnostic_code=None,
+        message=None,
+        terminal=True,
+    )
+
+    with pytest.raises(ClassificationError, match="malformed_baseline"):
+        classify_failure(malformed)

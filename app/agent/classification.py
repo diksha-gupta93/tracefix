@@ -2,8 +2,19 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum
+from pathlib import Path
 
-from app.agent.schemas import BaselineOutcome, BaselineResult, FailureAnalysis, FailureCategory
+from pydantic import ValidationError
+
+from app.agent.schemas import (
+    BaselineEvidence,
+    BaselineOutcome,
+    BaselineResult,
+    FailureAnalysis,
+    FailureCategory,
+    RepositoryPreparation,
+)
+from app.sandbox.results import SandboxCompletion
 
 
 class ClassificationErrorCode(StrEnum):
@@ -68,12 +79,55 @@ _SIGNALS: tuple[tuple[FailureCategory, tuple[re.Pattern[str], ...]], ...] = (
     ),
 )
 
-_HOST_PATH = re.compile(r"(?i)(?:[a-z]:[\\/]|/(?:home|users|tmp|var|private)/)\S+")
+_HOST_PATHS = (
+    re.compile(
+        r"(?i)(?:\"(?:[a-z]:[\\/]|\\\\(?:[?.][\\/]|[^\\/\s]+[\\/])|/)[^\"\r\n]+\"|"
+        r"'(?:[a-z]:[\\/]|\\\\(?:[?.][\\/]|[^\\/\s]+[\\/])|/)[^'\r\n]+')"
+    ),
+    re.compile(r"(?i)(?:[a-z]:[\\/]|\\\\(?:[?.][\\/]|[^\\/\s]+[\\/]))[^\s\"']*"),
+    re.compile(r"(?<![\w.])/(?:[^/\s\"']+/)*[^\s\"']*"),
+)
+_SECRET_PATTERNS = (
+    re.compile(
+        r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----.*?"
+        r"-----END (?:[A-Z ]+ )?PRIVATE KEY-----",
+        re.DOTALL,
+    ),
+    re.compile(
+        r"(?im)^(\s*(?:api[_-]?key|access[_-]?token|client[_-]?secret|password)\s*=\s*)"
+        r'(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|[^\r\n#]+)'
+    ),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+)
 
 
-def _summary(category: FailureCategory, evidence: str) -> str:
-    for line in evidence.splitlines():
-        cleaned = _HOST_PATH.sub("<host-path>", line).strip()
+def redact_host_paths(value: str, repository_root: str | None = None) -> str:
+    redacted = value
+    if repository_root:
+        variants = {
+            repository_root,
+            repository_root.replace("\\", "/"),
+            repository_root.replace("/", "\\"),
+        }
+        for variant in sorted(variants, key=len, reverse=True):
+            redacted = re.sub(re.escape(variant), "<repository>", redacted, flags=re.IGNORECASE)
+    for pattern in _HOST_PATHS:
+        redacted = pattern.sub("<host-path>", redacted)
+    return redacted
+
+
+def redact_untrusted_evidence(value: str, repository_root: str | None = None) -> str:
+    redacted = redact_host_paths(value, repository_root)
+    for index, pattern in enumerate(_SECRET_PATTERNS):
+        replacement = r"\1<redacted-secret>" if index == 1 else "<redacted-secret>"
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+def _summary(category: FailureCategory, evidence: str, repository_root: str) -> str:
+    redacted = redact_untrusted_evidence(evidence, repository_root)
+    for line in redacted.splitlines():
+        cleaned = line.strip()
         if cleaned:
             bounded = cleaned.encode("utf-8")[:240].decode("utf-8", errors="ignore")
             return f"{category.value}: {bounded}"
@@ -81,23 +135,56 @@ def _summary(category: FailureCategory, evidence: str) -> str:
 
 
 def classify_failure(baseline: BaselineResult) -> FailureAnalysis:
-    if baseline.outcome is not BaselineOutcome.REPRODUCED_FAILURE:
-        raise ClassificationError(ClassificationErrorCode.BASELINE_NOT_REPRODUCED)
-    evidence = baseline.evidence
-    if evidence is None or evidence.exit_code in (None, 0):
-        raise ClassificationError(ClassificationErrorCode.MALFORMED_BASELINE)
-    combined = "\n".join((evidence.stdout, evidence.stderr))
+    try:
+        outcome = baseline.outcome
+        evidence = baseline.evidence
+        preparation = baseline.preparation
+        diagnostic_code = baseline.diagnostic_code
+        message = baseline.message
+        terminal = baseline.terminal
+        if outcome is not BaselineOutcome.REPRODUCED_FAILURE:
+            raise ClassificationError(ClassificationErrorCode.BASELINE_NOT_REPRODUCED)
+        if not isinstance(evidence, BaselineEvidence) or not isinstance(
+            preparation, RepositoryPreparation
+        ):
+            raise ClassificationError(ClassificationErrorCode.MALFORMED_BASELINE)
+        if (
+            type(evidence.exit_code) is not int
+            or type(evidence.stdout) is not str
+            or type(evidence.stderr) is not str
+            or type(evidence.stdout_truncated) is not bool
+            or type(evidence.stderr_truncated) is not bool
+        ):
+            raise ClassificationError(ClassificationErrorCode.MALFORMED_BASELINE)
+        evidence = BaselineEvidence.model_validate(evidence.model_dump())
+        preparation = RepositoryPreparation.model_validate(preparation.model_dump())
+        if (
+            evidence.completion is not SandboxCompletion.NORMAL
+            or evidence.exit_code == 0
+            or not isinstance(preparation.prepared_repository, Path)
+            or diagnostic_code is not None
+            or message is not None
+            or terminal is not True
+        ):
+            raise ClassificationError(ClassificationErrorCode.MALFORMED_BASELINE)
+        combined = "\n".join((evidence.stdout, evidence.stderr))
+        repository_root = str(preparation.prepared_repository)
+    except ClassificationError:
+        raise
+    except (AttributeError, TypeError, ValidationError, ValueError):
+        raise ClassificationError(ClassificationErrorCode.MALFORMED_BASELINE) from None
     if evidence.stdout_truncated or evidence.stderr_truncated:
         category = FailureCategory.unsupported_or_ambiguous
-        return FailureAnalysis(category=category, summary=_summary(category, combined))
+        return FailureAnalysis(
+            category=category,
+            summary=_summary(category, combined, repository_root),
+        )
 
     matched = tuple(
         category for category, patterns in _SIGNALS if any(p.search(combined) for p in patterns)
     )
-    if FailureCategory.syntax_failure in matched:
-        category = FailureCategory.syntax_failure
-    elif len(matched) == 1:
-        category = matched[0]
-    else:
-        category = FailureCategory.unsupported_or_ambiguous
-    return FailureAnalysis(category=category, summary=_summary(category, combined))
+    category = matched[0] if len(matched) == 1 else FailureCategory.unsupported_or_ambiguous
+    return FailureAnalysis(
+        category=category,
+        summary=_summary(category, combined, repository_root),
+    )

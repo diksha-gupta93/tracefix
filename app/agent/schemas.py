@@ -191,7 +191,7 @@ class TestResult(BaseModel):
 
 
 class FailureAnalysis(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, validate_assignment=True)
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     category: FailureCategory
     summary: NonBlankString
@@ -220,6 +220,19 @@ class ContextOmissionReason(StrEnum):
     UNRELATED = "unrelated"
 
 
+def _validate_context_path(path: PurePosixPath) -> None:
+    value = path.as_posix()
+    if (
+        path.is_absolute()
+        or not value
+        or value == "."
+        or "\\" in value
+        or "\x00" in value
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise ValueError("context path must be a normalized relative POSIX path")
+
+
 class ContextItem(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
@@ -233,22 +246,18 @@ class ContextItem(BaseModel):
 
     @model_validator(mode="after")
     def validate_relative_path_and_size(self) -> ContextItem:
-        value = self.path.as_posix()
-        if (
-            self.path.is_absolute()
-            or not value
-            or value == "."
-            or "\\" in value
-            or "\x00" in value
-            or any(part in {"", ".", ".."} for part in self.path.parts)
-        ):
-            raise ValueError("context path must be a normalized relative POSIX path")
+        _validate_context_path(self.path)
         if self.original_utf8_bytes < len(self.content.encode("utf-8")):
             raise ValueError("original size cannot be smaller than included content")
+        if self.truncated != (self.original_utf8_bytes > len(self.content.encode("utf-8"))):
+            raise ValueError("truncation metadata is inconsistent")
         return self
 
     def downstream_text(self) -> str:
-        return f"[{self.kind.value}] {self.path.as_posix()}\n{self.content}\n"
+        return (
+            f"[{self.kind.value}|{self.path.as_posix()}|p={self.priority}|l={self.source_line}|"
+            f"t={int(self.truncated)}|b={self.original_utf8_bytes}]\n{self.content}\n"
+        )
 
 
 class ContextOmission(BaseModel):
@@ -257,6 +266,11 @@ class ContextOmission(BaseModel):
     path: PurePosixPath
     kind: ContextItemKind
     reason: ContextOmissionReason
+
+    @model_validator(mode="after")
+    def validate_relative_path(self) -> ContextOmission:
+        _validate_context_path(self.path)
+        return self
 
 
 class ProtectedPathPolicy(BaseModel):
@@ -270,7 +284,11 @@ class ProtectedPathPolicy(BaseModel):
         if not self.protected_paths or self.exceptions:
             raise ValueError("protected-path policy must be non-empty and grant no exceptions")
         values = tuple(path.as_posix() for path in self.protected_paths)
-        if values != tuple(sorted(set(values), key=str.casefold)):
+        for path in self.protected_paths:
+            _validate_context_path(path)
+        if len({value.casefold() for value in values}) != len(values) or values != tuple(
+            sorted(values, key=str.casefold)
+        ):
             raise ValueError("protected paths must be unique and deterministically ordered")
         return self
 
@@ -288,7 +306,51 @@ class ContextPackage(BaseModel):
     safe_material_omitted: Annotated[bool, Field(strict=True)]
 
     def downstream_text(self) -> str:
-        return "".join(item.downstream_text() for item in self.items)
+        return self.render_downstream(
+            case_id=self.case_id,
+            items=self.items,
+            omissions=self.omissions,
+            limit_utf8_bytes=self.limit_utf8_bytes,
+            safe_material_omitted=self.safe_material_omitted,
+        )
+
+    @staticmethod
+    def render_downstream(
+        *,
+        case_id: str,
+        items: tuple[ContextItem, ...],
+        omissions: tuple[ContextOmission, ...],
+        limit_utf8_bytes: int,
+        safe_material_omitted: bool,
+    ) -> str:
+        header = (
+            f"[context|{case_id}|limit={limit_utf8_bytes}|omitted={int(safe_material_omitted)}]\n"
+        )
+        rendered_items = "".join(item.downstream_text() for item in items)
+        rendered_omissions = "".join(
+            f"[omission|{item.path.as_posix()}|{item.kind.value}|{item.reason.value}]\n"
+            for item in omissions
+        )
+        return header + rendered_items + rendered_omissions
+
+    @staticmethod
+    def downstream_utf8_size(
+        *,
+        case_id: str,
+        items: tuple[ContextItem, ...],
+        omissions: tuple[ContextOmission, ...],
+        limit_utf8_bytes: int,
+        safe_material_omitted: bool,
+    ) -> int:
+        return len(
+            ContextPackage.render_downstream(
+                case_id=case_id,
+                items=items,
+                omissions=omissions,
+                limit_utf8_bytes=limit_utf8_bytes,
+                safe_material_omitted=safe_material_omitted,
+            ).encode("utf-8")
+        )
 
     @model_validator(mode="after")
     def validate_accounting_and_order(self) -> ContextPackage:
@@ -301,8 +363,43 @@ class ContextPackage(BaseModel):
         )
         if order != tuple(sorted(order)):
             raise ValueError("context items are not deterministically ordered")
-        if self.safe_material_omitted != bool(self.omissions):
+        safe_material_omitted = any(item.truncated for item in self.items) or any(
+            omission.reason is ContextOmissionReason.BUDGET for omission in self.omissions
+        )
+        if self.safe_material_omitted != safe_material_omitted:
             raise ValueError("omission flag does not match omission metadata")
+        item_keys = tuple(
+            (item.path.as_posix().casefold(), item.kind.value, item.source_line)
+            for item in self.items
+        )
+        if len(set(item_keys)) != len(item_keys):
+            raise ValueError("context items contain duplicates")
+        omission_keys = tuple(
+            (item.path.as_posix().casefold(), item.kind.value, item.reason.value)
+            for item in self.omissions
+        )
+        if omission_keys != tuple(sorted(omission_keys)):
+            raise ValueError("context omissions are not deterministically ordered")
+        if len(set(omission_keys)) != len(omission_keys):
+            raise ValueError("context omissions contain duplicates")
+        if not any(item.kind is ContextItemKind.ISSUE for item in self.items):
+            raise ValueError("issue is not represented in downstream context")
+        classification_content = (
+            f"{self.failure_analysis.category.value}\n{self.failure_analysis.summary}"
+        )
+        if not any(
+            item.kind is ContextItemKind.CLASSIFICATION and item.content == classification_content
+            for item in self.items
+        ):
+            raise ValueError("failure analysis is not represented in downstream context")
+        policy_content = "\n".join(
+            path.as_posix() for path in self.protected_path_policy.protected_paths
+        )
+        if not any(
+            item.kind is ContextItemKind.PROTECTED_PATH_POLICY and item.content == policy_content
+            for item in self.items
+        ):
+            raise ValueError("protected-path policy is not represented in downstream context")
         return self
 
 

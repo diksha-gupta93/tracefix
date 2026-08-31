@@ -543,10 +543,20 @@ class RepositoryPreparer:
             self._cleanup_failed(destination, created, destination_identity, copy_error)
             raise copy_error from error
 
-    def fingerprint(self, repository: Path) -> RepositoryFingerprint:
+    def fingerprint(
+        self,
+        repository: Path,
+        *,
+        deny_path: Callable[[PurePosixPath], bool] | None = None,
+    ) -> RepositoryFingerprint:
         try:
             root = repository.resolve(strict=True)
             entries = self._filesystem.snapshot(root)
+            if deny_path is not None and any(deny_path(entry.path) for entry in entries):
+                raise PreparationError(
+                    PreparationErrorCode.UNSAFE_SOURCE,
+                    "repository contains a denied path",
+                )
             digest = hashlib.sha256(_FINGERPRINT_HEADER)
             for entry in entries:
                 path_bytes = entry.path.as_posix().encode("utf-8")
