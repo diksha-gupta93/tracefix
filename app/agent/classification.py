@@ -85,7 +85,12 @@ _HOST_PATHS = (
         r"'(?:[a-z]:[\\/]|\\\\(?:[?.][\\/]|[^\\/\s]+[\\/])|/)[^'\r\n]+')"
     ),
     re.compile(r"(?i)(?:[a-z]:[\\/]|\\\\(?:[?.][\\/]|[^\\/\s]+[\\/]))[^\s\"']*"),
-    re.compile(r"(?<![\w.])/(?:[^/\s\"']+/)*[^\s\"']*"),
+    re.compile(r"(?<![\w.])/(?:[^/\s\"']+/)*[^/\s\"'][^\s\"']*"),
+)
+_DENIED_EVIDENCE_PATH = re.compile(
+    r"(?i)(?:^|[\\/\s\"'(])(?:evaluator|hidden_tests)(?:[\\/]|$)|"
+    r"(?:^|[\\/\s\"'(])reference\.patch(?:$|[\s:\"')])",
+    re.MULTILINE,
 )
 _SECRET_PATTERNS = (
     re.compile(
@@ -122,6 +127,10 @@ def redact_untrusted_evidence(value: str, repository_root: str | None = None) ->
         replacement = r"\1<redacted-secret>" if index == 1 else "<redacted-secret>"
         redacted = pattern.sub(replacement, redacted)
     return redacted
+
+
+def contains_denied_evidence_path(value: str) -> bool:
+    return _DENIED_EVIDENCE_PATH.search(value) is not None
 
 
 def _summary(category: FailureCategory, evidence: str, repository_root: str) -> str:
@@ -173,11 +182,12 @@ def classify_failure(baseline: BaselineResult) -> FailureAnalysis:
         raise
     except (AttributeError, TypeError, ValidationError, ValueError):
         raise ClassificationError(ClassificationErrorCode.MALFORMED_BASELINE) from None
-    if evidence.stdout_truncated or evidence.stderr_truncated:
+    denied_evidence = contains_denied_evidence_path(combined)
+    if evidence.stdout_truncated or evidence.stderr_truncated or denied_evidence:
         category = FailureCategory.unsupported_or_ambiguous
         return FailureAnalysis(
             category=category,
-            summary=_summary(category, combined, repository_root),
+            summary=_summary(category, "" if denied_evidence else combined, repository_root),
         )
 
     matched = tuple(

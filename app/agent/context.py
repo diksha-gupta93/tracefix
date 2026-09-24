@@ -16,6 +16,7 @@ from app.agent.classification import (
     ClassificationError,
     ClassificationErrorCode,
     classify_failure,
+    contains_denied_evidence_path,
     redact_host_paths,
     redact_untrusted_evidence,
 )
@@ -113,6 +114,7 @@ class ContextSelectionErrorCode(StrEnum):
     UNSAFE_REPOSITORY = "unsafe_repository"
     FINGERPRINT_MISMATCH = "fingerprint_mismatch"
     VISIBLE_TEST_AMBIGUOUS = "visible_test_ambiguous"
+    UNSAFE_EVIDENCE = "unsafe_evidence"
     MANDATORY_CONTEXT_OVERFLOW = "mandatory_context_overflow"
     STATE_TRANSITION_INVALID = "state_transition_invalid"
 
@@ -126,7 +128,14 @@ class ContextSelectionError(Exception):
 
 
 class ContextFilesystem(Protocol):
-    def read_bytes(self, path: Path, expected: os.stat_result) -> bytes: ...
+    def read_bytes(
+        self,
+        root: Path,
+        path: PurePosixPath,
+        expected_root: os.stat_result,
+        expected_directories: tuple[os.stat_result, ...],
+        expected: os.stat_result,
+    ) -> bytes: ...
 
     def lstat(self, path: Path) -> os.stat_result: ...
 
@@ -134,9 +143,38 @@ class ContextFilesystem(Protocol):
 
 
 class LocalContextFilesystem:
-    def read_bytes(self, path: Path, expected: os.stat_result) -> bytes:
+    def read_bytes(
+        self,
+        root: Path,
+        path: PurePosixPath,
+        expected_root: os.stat_result,
+        expected_directories: tuple[os.stat_result, ...],
+        expected: os.stat_result,
+    ) -> bytes:
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(path, flags)
+        if os.name == "nt":
+            descriptor = os.open(root.joinpath(*path.parts), flags)
+        else:
+            directory_flags = (
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            )
+            directories: list[int] = []
+            try:
+                current = os.open(root, directory_flags)
+                directories.append(current)
+                if not _same_file_identity(os.fstat(current), expected_root):
+                    raise OSError("opened context root does not match inspected directory")
+                for part, expected_directory in zip(
+                    path.parts[:-1], expected_directories, strict=True
+                ):
+                    current = os.open(part, directory_flags, dir_fd=current)
+                    directories.append(current)
+                    if not _same_file_identity(os.fstat(current), expected_directory):
+                        raise OSError("opened context directory does not match inspected directory")
+                descriptor = os.open(path.name, flags, dir_fd=current)
+            finally:
+                for directory in reversed(directories):
+                    os.close(directory)
         try:
             opened = os.fstat(descriptor)
             if not _same_file_identity(opened, expected) or not stat.S_ISREG(opened.st_mode):
@@ -228,7 +266,17 @@ def _is_denied(path: PurePosixPath) -> ContextOmissionReason | None:
         return ContextOmissionReason.GENERATED
     if any(part in _SECRET_NAMES for part in lowered):
         return ContextOmissionReason.SECRET
+    if _is_protected(path):
+        return ContextOmissionReason.UNSAFE_PATH
     return None
+
+
+def _is_protected(path: PurePosixPath) -> bool:
+    lowered = tuple(part.casefold() for part in path.parts)
+    return any(
+        lowered[: len(protected.parts)] == tuple(part.casefold() for part in protected.parts)
+        for protected in _PROTECTED
+    )
 
 
 def _is_evaluator_path(path: PurePosixPath) -> bool:
@@ -327,8 +375,8 @@ class ContextSelector:
             ValueError,
             KeyError,
             TypeError,
-        ) as error:
-            raise ContextSelectionError(ContextSelectionErrorCode.CASE_LOAD_FAILED) from error
+        ):
+            raise ContextSelectionError(ContextSelectionErrorCode.CASE_LOAD_FAILED) from None
         try:
             if not isinstance(case, TrustedCase):
                 raise ContextSelectionError(ContextSelectionErrorCode.CASE_LOAD_FAILED)
@@ -349,10 +397,25 @@ class ContextSelector:
                 or type(issue_description) is not str
             ):
                 raise ContextSelectionError(ContextSelectionErrorCode.CASE_LOAD_FAILED)
+            validated_visible: list[PurePosixPath] = []
+            visible_keys: set[str] = set()
+            for value in visible_tests:
+                path = _safe_relative(value)
+                if (
+                    path is None
+                    or path.parts[:1] != ("tests",)
+                    or not path.name.startswith("test_")
+                    or path.suffix != ".py"
+                    or _is_denied(path) is not None
+                    or path.as_posix().casefold() in visible_keys
+                ):
+                    raise ContextSelectionError(ContextSelectionErrorCode.CASE_LOAD_FAILED)
+                visible_keys.add(path.as_posix().casefold())
+                validated_visible.append(path)
         except ContextSelectionError:
             raise
-        except (AttributeError, TypeError, ValidationError, ValueError) as error:
-            raise ContextSelectionError(ContextSelectionErrorCode.CASE_LOAD_FAILED) from error
+        except (AttributeError, TypeError, ValidationError, ValueError):
+            raise ContextSelectionError(ContextSelectionErrorCode.CASE_LOAD_FAILED) from None
         if (
             trusted_case_id != baseline.preparation.case_id
             or failing_revision != baseline.preparation.requested_revision
@@ -383,15 +446,19 @@ class ContextSelector:
                 raise ContextSelectionError(
                     ContextSelectionErrorCode.UNSAFE_REPOSITORY, denied_repository_path
                 )
+            if any(path not in repository_files for path in validated_visible):
+                raise ContextSelectionError(ContextSelectionErrorCode.PREPARATION_MISMATCH)
             fingerprint = self._fingerprinter(root)
         except ContextSelectionError:
             raise
-        except (OSError, RuntimeError, ValueError, PreparationError) as error:
-            raise ContextSelectionError(ContextSelectionErrorCode.UNSAFE_REPOSITORY) from error
+        except (OSError, RuntimeError, ValueError, PreparationError):
+            raise ContextSelectionError(ContextSelectionErrorCode.UNSAFE_REPOSITORY) from None
         if fingerprint != baseline.preparation.fingerprint:
             raise ContextSelectionError(ContextSelectionErrorCode.FINGERPRINT_MISMATCH)
 
         raw_evidence = "\n".join((baseline_evidence.stdout, baseline_evidence.stderr)).strip()
+        if self._evidence_has_unsafe_path(raw_evidence):
+            raise ContextSelectionError(ContextSelectionErrorCode.UNSAFE_EVIDENCE)
         frames = self._frames(raw_evidence, root)
         visible, visible_node = self._visible_test(case, raw_evidence, frames)
         evidence = redact_untrusted_evidence(raw_evidence, str(root))
@@ -410,9 +477,34 @@ class ContextSelector:
                 raise ContextSelectionError(ContextSelectionErrorCode.FINGERPRINT_MISMATCH)
         except ContextSelectionError:
             raise
-        except (OSError, RuntimeError, ValueError, PreparationError) as error:
-            raise ContextSelectionError(ContextSelectionErrorCode.UNSAFE_REPOSITORY) from error
+        except (OSError, RuntimeError, ValueError, PreparationError):
+            raise ContextSelectionError(ContextSelectionErrorCode.UNSAFE_REPOSITORY) from None
         return self._package(trusted_case_id, analysis, candidates, omissions, limit)
+
+    @staticmethod
+    def _evidence_has_unsafe_path(evidence: str) -> bool:
+        if contains_denied_evidence_path(evidence):
+            return True
+        normalized = evidence.replace("\\", "/")
+        matches = sorted(
+            (
+                *_TRACEBACK_COLON_FRAME.finditer(normalized),
+                *_TRACEBACK_FILE_FRAME.finditer(normalized),
+            ),
+            key=lambda match: match.start(),
+        )
+        spellings: dict[str, str] = {}
+        for match in matches:
+            raw = match.group("path").strip()
+            relative = _safe_relative(raw)
+            if relative is None or _is_evaluator_path(relative):
+                return True
+            path_value = relative.as_posix()
+            path_key = path_value.casefold()
+            prior = spellings.setdefault(path_key, path_value)
+            if prior != path_value:
+                return True
+        return False
 
     @staticmethod
     def _visible_test(
@@ -428,7 +520,9 @@ class ContextSelector:
                 pattern = re.compile(rf"(?m)(?:^|[\s\"']){re.escape(variant)}::(?P<node>[^\s]+)")
                 match = pattern.search(evidence)
                 if match is not None:
-                    node_matches[path] = match.group("node").split("::")[-1].split("[")[0]
+                    parts = match.group("node").split("::")
+                    parts[-1] = parts[-1].split("[", maxsplit=1)[0]
+                    node_matches[path] = "::".join(parts)
                     break
         if len(node_matches) == 1:
             return next(iter(node_matches.items()))
@@ -451,11 +545,27 @@ class ContextSelector:
             tree = ast.parse(text)
         except (SyntaxError, ValueError):
             return 1
+        definitions: list[tuple[str, int]] = []
+
+        def collect(nodes: list[ast.stmt], prefix: tuple[str, ...]) -> None:
+            for node in nodes:
+                if isinstance(node, ast.ClassDef):
+                    collect(node.body, (*prefix, node.name))
+                elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                    definitions.append(("::".join((*prefix, node.name)), node.lineno))
+
+        collect(tree.body, ())
+        exact = sorted(line for qualified, line in definitions if qualified == node_name)
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            raise ContextSelectionError(ContextSelectionErrorCode.VISIBLE_TEST_AMBIGUOUS)
+        leaf = node_name.split("::")[-1]
         matching = sorted(
-            node.lineno
-            for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == node_name
+            line for qualified, line in definitions if qualified.split("::")[-1] == leaf
         )
+        if len(matching) > 1:
+            raise ContextSelectionError(ContextSelectionErrorCode.VISIBLE_TEST_AMBIGUOUS)
         return matching[0] if matching else 1
 
     @staticmethod
@@ -495,11 +605,21 @@ class ContextSelector:
     def _read(
         self, root: Path, path: PurePosixPath
     ) -> tuple[str | None, ContextOmissionReason | None]:
+        if _safe_relative(path.as_posix()) != path:
+            return None, ContextOmissionReason.UNSAFE_PATH
         denied = _is_denied(path)
         if denied is not None:
             return None, denied
         target = root.joinpath(*path.parts)
         try:
+            root_before = self._filesystem.lstat(root)
+            root_attributes = getattr(root_before, "st_file_attributes", 0)
+            if (
+                not stat.S_ISDIR(root_before.st_mode)
+                or stat.S_ISLNK(root_before.st_mode)
+                or root_attributes & _WINDOWS_REPARSE_POINT
+            ):
+                return None, ContextOmissionReason.UNSAFE_PATH
             component = root
             component_metadata: list[tuple[Path, os.stat_result]] = []
             for part in path.parts[:-1]:
@@ -517,11 +637,18 @@ class ContextSelector:
             attributes = getattr(before, "st_file_attributes", 0)
             if not stat.S_ISREG(before.st_mode) or attributes & _WINDOWS_REPARSE_POINT:
                 return None, ContextOmissionReason.UNSAFE_PATH
-            data = self._filesystem.read_bytes(target, before)
+            data = self._filesystem.read_bytes(
+                root,
+                path,
+                root_before,
+                tuple(metadata for _, metadata in component_metadata),
+                before,
+            )
             after = self._filesystem.lstat(target)
             if (
                 not _same_file_identity(before, after)
                 or len(data) != before.st_size
+                or not _same_file_identity(self._filesystem.lstat(root), root_before)
                 or any(
                     not _same_file_identity(self._filesystem.lstat(item), expected)
                     for item, expected in component_metadata
@@ -778,10 +905,7 @@ class ContextSelector:
                 visited.add(key)
                 selected_nodes[id(node)] = node
         pending_names = {
-            child.id
-            for node in selected_nodes.values()
-            for child in ast.walk(node)
-            if isinstance(child, ast.Name)
+            child for node in selected_nodes.values() for child in self._loaded_unbound_names(node)
         }
         while pending_names:
             name = min(pending_names)
@@ -795,15 +919,11 @@ class ContextSelector:
                 continue
             visited.add(related_key)
             selected_nodes[id(related)] = related
-            pending_names.update(
-                child.id for child in ast.walk(related) if isinstance(child, ast.Name)
-            )
+            pending_names.update(self._loaded_unbound_names(related))
         nodes = sorted(
             selected_nodes.values(), key=lambda node: (node.lineno, node.end_lineno or 0)
         )
-        referenced_names = {
-            child.id for node in nodes for child in ast.walk(node) if isinstance(child, ast.Name)
-        }
+        referenced_names = {child for node in nodes for child in self._loaded_unbound_names(node)}
         for node in nodes:
             start = node.lineno
             end = node.end_lineno or node.lineno
@@ -856,6 +976,33 @@ class ContextSelector:
                 omissions,
                 visited,
             )
+
+    @staticmethod
+    def _loaded_unbound_names(
+        node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | ast.TypeAlias,
+    ) -> set[str]:
+        loaded = {
+            child.id
+            for child in ast.walk(node)
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+        }
+        bound = {
+            child.id
+            for child in ast.walk(node)
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+        }
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            arguments = (
+                *node.args.posonlyargs,
+                *node.args.args,
+                *node.args.kwonlyargs,
+            )
+            bound.update(argument.arg for argument in arguments)
+            if node.args.vararg is not None:
+                bound.add(node.args.vararg.arg)
+            if node.args.kwarg is not None:
+                bound.add(node.args.kwarg.arg)
+        return loaded - bound
 
     @staticmethod
     def _definition_name(
@@ -1072,14 +1219,15 @@ def apply_failure_analysis(
         or baseline.outcome is not BaselineOutcome.REPRODUCED_FAILURE
         or state.case_id != baseline.preparation.case_id
         or expected_analysis != analysis
+        or state.failure_analysis is not None
+        or state.repair_plan is not None
+        or state.candidate_patch is not None
+        or bool(state.verification_results)
+        or bool(state.evaluation_results)
     ):
         raise ContextSelectionError(ContextSelectionErrorCode.STATE_TRANSITION_INVALID)
-    values = state.model_dump()
-    values.update(
-        {
-            "failure_analysis": analysis,
-            "status": RepairStatus.analysis_complete,
-            "updated_at": datetime.now(UTC),
-        }
-    )
-    return LocalRepairCaseState.model_validate(values)
+    updated = state.model_copy(deep=True)
+    updated.failure_analysis = analysis
+    updated.status = RepairStatus.analysis_complete
+    updated.updated_at = datetime.now(UTC)
+    return updated

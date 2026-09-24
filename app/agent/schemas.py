@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Annotated, Literal
 
 from pydantic import (
@@ -222,8 +222,11 @@ class ContextOmissionReason(StrEnum):
 
 def _validate_context_path(path: PurePosixPath) -> None:
     value = path.as_posix()
+    windows = PureWindowsPath(value)
     if (
         path.is_absolute()
+        or bool(windows.drive)
+        or bool(windows.root)
         or not value
         or value == "."
         or "\\" in value

@@ -36,6 +36,7 @@ from app.agent.schemas import (
     FailureCategory,
     LocalRepairCaseState,
     ProtectedPathPolicy,
+    RepairPlan,
     RepairStatus,
     RepositoryFingerprint,
     RepositoryPreparation,
@@ -43,6 +44,14 @@ from app.agent.schemas import (
 )
 from app.sandbox import SandboxCompletion
 from benchmarks.loader import Manifest, TrustedCase, load_trusted_case
+
+_FIXTURE_FRAMES = {
+    "boundary_condition": ("test_full_page", "src/pagination/pagination.py", 2),
+    "exception_handling": ("test_invalid_port_returns_none", "src/parser/parser.py", 3),
+    "fixture_or_mocking": ("test_greeting_uses_user_client", "src/greeter/greeter.py", 9),
+    "incorrect_conditional": ("test_adult_is_eligible", "src/eligibility/eligibility.py", 5),
+    "incorrect_return_value": ("test_normalizes_name", "src/normalizer/normalizer.py", 2),
+}
 
 
 def _prepared(tmp_path: Path, case_id: str = "incorrect_conditional") -> BaselineResult:
@@ -56,9 +65,10 @@ def _prepared(tmp_path: Path, case_id: str = "incorrect_conditional") -> Baselin
         prepared_repository=repository.resolve(),
         fingerprint=RepositoryPreparer(load_trusted_case).fingerprint(repository),
     )
+    node, source, source_line = _FIXTURE_FRAMES[case_id]
     evidence = (
-        f"{case.manifest.visible_tests[0]}::test_age_eligibility FAILED\n"
-        "src/eligibility/eligibility.py:5: in is_eligible\n"
+        f"{case.manifest.visible_tests[0]}::{node} FAILED\n"
+        f"{source}:{source_line}: in failing_function\n"
         "E   assert False"
     )
     return BaselineResult(
@@ -259,6 +269,53 @@ def test_visible_test_node_id_selects_relevant_distant_excerpt(tmp_path: Path) -
         ContextSelector(lambda _: changed_case).select(incidental, classify_failure(incidental))
 
 
+def test_qualified_visible_test_node_selects_exact_class_and_unqualified_is_ambiguous(
+    tmp_path: Path,
+) -> None:
+    baseline = _prepared(tmp_path)
+    repository = baseline.preparation.prepared_repository
+    visible_path = repository / "tests/test_behavior.py"
+    visible_path.write_text(
+        "class TestA:\n"
+        "    def test_same(self):\n"
+        "        assert False\n\n"
+        "class TestB:\n"
+        "    def test_same(self):\n"
+        "        assert False\n",
+        encoding="utf-8",
+    )
+    preparation = baseline.preparation.model_copy(
+        update={"fingerprint": RepositoryPreparer(load_trusted_case).fingerprint(repository)}
+    )
+    evidence = baseline.evidence
+    assert evidence is not None
+    qualified = baseline.model_copy(
+        update={
+            "preparation": preparation,
+            "evidence": evidence.model_copy(
+                update={
+                    "stdout": "tests/test_behavior.py::TestB::test_same FAILED\nE   assert False"
+                }
+            ),
+        }
+    )
+
+    package = ContextSelector(load_trusted_case).select(qualified, classify_failure(qualified))
+    selected = next(item for item in package.items if item.kind is ContextItemKind.VISIBLE_TEST)
+    assert selected.source_line == 6
+    assert "class TestB" in selected.content
+
+    unqualified = qualified.model_copy(
+        update={
+            "evidence": evidence.model_copy(
+                update={"stdout": "tests/test_behavior.py::test_same FAILED\nE   assert False"}
+            )
+        }
+    )
+    with pytest.raises(ContextSelectionError, match="visible_test_ambiguous"):
+        ContextSelector(load_trusted_case).select(unqualified, classify_failure(unqualified))
+
+
 def test_mandatory_overflow_and_stale_fingerprint_fail_closed(tmp_path: Path) -> None:
     baseline = _prepared(tmp_path)
     analysis = classify_failure(baseline)
@@ -335,6 +392,52 @@ def test_typed_state_update_rejects_analysis_that_does_not_match_baseline(tmp_pa
     assert state.model_dump() == before
 
 
+@pytest.mark.parametrize("existing_analysis_matches", [True, False])
+def test_typed_state_update_rejects_existing_analysis_without_mutation(
+    tmp_path: Path, existing_analysis_matches: bool
+) -> None:
+    baseline = _prepared(tmp_path)
+    analysis = classify_failure(baseline)
+    existing = (
+        analysis
+        if existing_analysis_matches
+        else FailureAnalysis(category=FailureCategory.timeout, summary="stale")
+    )
+    state = LocalRepairCaseState(
+        case_id=baseline.preparation.case_id,
+        status=RepairStatus.baseline_complete,
+        baseline_result=baseline,
+        failure_analysis=existing,
+    )
+    before = state.model_dump()
+
+    with pytest.raises(ContextSelectionError, match="state_transition_invalid"):
+        apply_failure_analysis(state, analysis)
+
+    assert state.model_dump() == before
+
+
+def test_typed_state_update_rejects_later_stage_partial_state(tmp_path: Path) -> None:
+    baseline = _prepared(tmp_path)
+    analysis = classify_failure(baseline)
+    state = LocalRepairCaseState(
+        case_id=baseline.preparation.case_id,
+        status=RepairStatus.baseline_complete,
+        baseline_result=baseline,
+        repair_plan=RepairPlan(
+            suspected_root_cause="stale plan",
+            files_expected_to_change=["source.py"],
+            intended_behavioural_correction="stale correction",
+            risks=["stale risk"],
+            validation_strategy="stale validation",
+            autonomous_repair_suitable=False,
+        ),
+    )
+
+    with pytest.raises(ContextSelectionError, match="state_transition_invalid"):
+        apply_failure_analysis(state, analysis)
+
+
 def test_evaluator_tree_is_rejected_before_fingerprinting_or_file_read(tmp_path: Path) -> None:
     baseline = _prepared(tmp_path)
     evaluator = baseline.preparation.prepared_repository / "evaluator" / "hidden_tests"
@@ -373,6 +476,91 @@ def test_evaluator_inserted_after_initial_scan_is_denied_before_content_read(
         ContextSelector(load_trusted_case, filesystem=InsertingFilesystem()).select(
             baseline, classify_failure(baseline)
         )
+
+
+@pytest.mark.parametrize("unsafe_visible", ["../outside.py", "/outside.py", "C:/outside.py"])
+def test_semantically_unsafe_manifest_visible_path_fails_before_read(
+    tmp_path: Path, unsafe_visible: str
+) -> None:
+    baseline = _prepared(tmp_path)
+    outside = tmp_path / "outside.py"
+    outside.write_text("OUTSIDE_SECRET = True\n", encoding="utf-8")
+    trusted = load_trusted_case(baseline.preparation.case_id)
+    manifest = trusted.manifest.model_copy(update={"visible_tests": (unsafe_visible,)})
+    malformed_case = trusted.model_copy(update={"manifest": manifest})
+
+    class NoReadFilesystem(LocalContextFilesystem):
+        read_called = False
+
+        def read_bytes(
+            self,
+            root: Path,
+            path: PurePosixPath,
+            expected_root: os.stat_result,
+            expected_directories: tuple[os.stat_result, ...],
+            expected: os.stat_result,
+        ) -> bytes:
+            self.read_called = True
+            return super().read_bytes(root, path, expected_root, expected_directories, expected)
+
+    filesystem = NoReadFilesystem()
+
+    with pytest.raises(ContextSelectionError, match="case_load_failed"):
+        ContextSelector(lambda _: malformed_case, filesystem=filesystem).select(
+            baseline, classify_failure(baseline)
+        )
+    assert not filesystem.read_called
+
+
+def test_protected_traceback_source_is_omitted_before_read(tmp_path: Path) -> None:
+    baseline = _prepared(tmp_path)
+    repository = baseline.preparation.prepared_repository
+    protected = repository / ".github/workflows/tool.py"
+    protected.parent.mkdir(parents=True)
+    protected.write_text("PROTECTED_MARKER = True\n", encoding="utf-8")
+    preparation = baseline.preparation.model_copy(
+        update={"fingerprint": RepositoryPreparer(load_trusted_case).fingerprint(repository)}
+    )
+    evidence = baseline.evidence
+    assert evidence is not None
+    changed = baseline.model_copy(
+        update={
+            "preparation": preparation,
+            "evidence": evidence.model_copy(
+                update={"stdout": evidence.stdout + "\n.github/workflows/tool.py:1: protected"}
+            ),
+        }
+    )
+
+    class ProtectedReadGuard(LocalContextFilesystem):
+        protected_read = False
+
+        def read_bytes(
+            self,
+            root: Path,
+            path: PurePosixPath,
+            expected_root: os.stat_result,
+            expected_directories: tuple[os.stat_result, ...],
+            expected: os.stat_result,
+        ) -> bytes:
+            if path == PurePosixPath(".github/workflows/tool.py"):
+                self.protected_read = True
+                raise AssertionError("protected path reached the read boundary")
+            return super().read_bytes(root, path, expected_root, expected_directories, expected)
+
+    filesystem = ProtectedReadGuard()
+
+    package = ContextSelector(load_trusted_case, filesystem=filesystem).select(
+        changed, classify_failure(changed)
+    )
+
+    assert not filesystem.protected_read
+    assert "PROTECTED_MARKER" not in package.downstream_text()
+    assert any(
+        omission.path == PurePosixPath(".github/workflows/tool.py")
+        and omission.reason is ContextOmissionReason.UNSAFE_PATH
+        for omission in package.omissions
+    )
 
 
 def test_mutation_after_initial_fingerprint_fails_before_return(tmp_path: Path) -> None:
@@ -425,15 +613,23 @@ def test_selected_file_replacement_is_rejected_before_replacement_bytes_are_read
     class ReplacingFilesystem(LocalContextFilesystem):
         replaced = False
 
-        def read_bytes(self, path: Path, expected: os.stat_result) -> bytes:
-            if path == source and not self.replaced:
+        def read_bytes(
+            self,
+            root: Path,
+            path: PurePosixPath,
+            expected_root: os.stat_result,
+            expected_directories: tuple[os.stat_result, ...],
+            expected: os.stat_result,
+        ) -> bytes:
+            target = root.joinpath(*path.parts)
+            if target == source and not self.replaced:
                 self.replaced = True
-                path.unlink()
+                target.unlink()
                 try:
-                    path.symlink_to(external)
+                    target.symlink_to(external)
                 except OSError as error:
                     pytest.skip(f"file symlinks unavailable: {error}")
-            return super().read_bytes(path, expected)
+            return super().read_bytes(root, path, expected_root, expected_directories, expected)
 
     filesystem = ReplacingFilesystem()
     with pytest.raises(ContextSelectionError, match="unsafe_repository"):
@@ -443,13 +639,84 @@ def test_selected_file_replacement_is_rejected_before_replacement_bytes_are_read
     assert filesystem.replaced
 
 
+def test_parent_directory_aba_alias_cannot_expose_external_bytes(tmp_path: Path) -> None:
+    baseline = _prepared(tmp_path)
+    repository = baseline.preparation.prepared_repository
+    parent = repository / "src/eligibility"
+    original = repository / "src/eligibility-original"
+    target = parent / "eligibility.py"
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "eligibility.py").write_text("EXTERNAL_SECRET = True\n", encoding="utf-8")
+
+    class AbaFilesystem(LocalContextFilesystem):
+        target_lstat_calls = 0
+        swapped = False
+
+        def _restore(self) -> None:
+            if self.swapped:
+                parent.unlink()
+                original.rename(parent)
+                self.swapped = False
+
+        def lstat(self, path: Path) -> os.stat_result:
+            if path == target:
+                self.target_lstat_calls += 1
+                if self.target_lstat_calls == 1:
+                    parent.rename(original)
+                    try:
+                        parent.symlink_to(external, target_is_directory=True)
+                    except OSError as error:
+                        original.rename(parent)
+                        pytest.skip(f"directory symlinks unavailable: {error}")
+                    self.swapped = True
+                metadata = super().lstat(path)
+                if self.target_lstat_calls == 2:
+                    self._restore()
+                return metadata
+            return super().lstat(path)
+
+        def read_bytes(
+            self,
+            root: Path,
+            path: PurePosixPath,
+            expected_root: os.stat_result,
+            expected_directories: tuple[os.stat_result, ...],
+            expected: os.stat_result,
+        ) -> bytes:
+            try:
+                return super().read_bytes(root, path, expected_root, expected_directories, expected)
+            except OSError:
+                self._restore()
+                raise
+
+    filesystem = AbaFilesystem()
+    package = ContextSelector(load_trusted_case, filesystem=filesystem).select(
+        baseline, classify_failure(baseline)
+    )
+
+    assert "EXTERNAL_SECRET" not in package.downstream_text()
+    assert any(
+        omission.path == PurePosixPath("src/eligibility/eligibility.py")
+        and omission.reason in {ContextOmissionReason.UNREADABLE, ContextOmissionReason.UNSAFE_PATH}
+        for omission in package.omissions
+    )
+    assert parent.is_dir() and not parent.is_symlink()
+
+
 def test_opened_file_identity_mismatch_fails_before_read(tmp_path: Path) -> None:
     selected = tmp_path / "selected.py"
     replacement = tmp_path / "replacement.py"
     selected.write_text("selected = True\n", encoding="utf-8")
     replacement.write_text("EXTERNAL_SECRET = True\n", encoding="utf-8")
     with pytest.raises(OSError, match="does not match"):
-        LocalContextFilesystem().read_bytes(selected, replacement.stat())
+        LocalContextFilesystem().read_bytes(
+            tmp_path,
+            PurePosixPath("selected.py"),
+            tmp_path.stat(),
+            (),
+            replacement.stat(),
+        )
 
 
 def test_access_time_change_does_not_change_file_identity() -> None:
@@ -477,7 +744,14 @@ def test_windows_reparse_ancestor_is_detected() -> None:
             metadata = reparse if path.name == "alias" else regular
             return cast(os.stat_result, metadata)
 
-        def read_bytes(self, path: Path, expected: os.stat_result) -> bytes:
+        def read_bytes(
+            self,
+            root: Path,
+            path: PurePosixPath,
+            expected_root: os.stat_result,
+            expected_directories: tuple[os.stat_result, ...],
+            expected: os.stat_result,
+        ) -> bytes:
             raise AssertionError("not used")
 
         def iter_files(self, root: Path) -> tuple[PurePosixPath, ...]:
@@ -486,7 +760,7 @@ def test_windows_reparse_ancestor_is_detected() -> None:
     assert _path_contains_alias(Path("C:/safe/alias/repository"), ReparseFilesystem())
 
 
-def test_failure_trace_redacts_absolute_paths_and_root_aliases(tmp_path: Path) -> None:
+def test_failure_trace_rejects_absolute_paths_and_root_aliases(tmp_path: Path) -> None:
     baseline = _prepared(tmp_path)
     root = str(baseline.preparation.prepared_repository)
     evidence = baseline.evidence
@@ -500,12 +774,38 @@ def test_failure_trace_redacts_absolute_paths_and_root_aliases(tmp_path: Path) -
     changed = baseline.model_copy(
         update={"evidence": evidence.model_copy(update={"stdout": stdout})}
     )
-    package = ContextSelector(load_trusted_case).select(changed, classify_failure(changed))
-    rendered = package.downstream_text()
-    assert root.upper() not in rendered
-    assert "/home/alice" not in rendered
-    assert "\\\\server\\share" not in rendered
-    assert "<host-path>" in rendered or "<repository>" in rendered
+    with pytest.raises(ContextSelectionError, match="unsafe_evidence"):
+        ContextSelector(load_trusted_case).select(changed, classify_failure(changed))
+
+
+@pytest.mark.parametrize(
+    "unsafe_frame",
+    [
+        "../escape.py:1: injected",
+        "src/../escape.py:1: injected",
+        "/outside/host.py:1: injected",
+        "C:\\outside\\host.py:1: injected",
+        "\\\\server\\share\\host.py:1: injected",
+        "evaluator/hidden_tests/test_secret.py:1: SECRET_REFERENCE",
+        "reference.patch: SECRET_REFERENCE",
+    ],
+)
+def test_unsafe_evidence_paths_fail_before_context_construction(
+    tmp_path: Path, unsafe_frame: str
+) -> None:
+    baseline = _prepared(tmp_path)
+    evidence = baseline.evidence
+    assert evidence is not None
+    changed = baseline.model_copy(
+        update={
+            "evidence": evidence.model_copy(
+                update={"stdout": evidence.stdout + "\n" + unsafe_frame}
+            )
+        }
+    )
+
+    with pytest.raises(ContextSelectionError, match="unsafe_evidence"):
+        ContextSelector(load_trusted_case).select(changed, classify_failure(changed))
 
 
 def test_traceback_frames_normalize_separators_deduplicate_and_reject_unsafe_forms() -> None:
@@ -672,6 +972,37 @@ def test_referenced_source_containing_host_path_is_omitted(tmp_path: Path, host_
     )
 
 
+def test_division_operator_in_referenced_source_is_not_a_host_path(tmp_path: Path) -> None:
+    baseline = _prepared(tmp_path)
+    repository = baseline.preparation.prepared_repository
+    source = repository / "src/eligibility/eligibility.py"
+    source.write_text(
+        "def is_eligible(total: int, count: int) -> bool:\n    return total / count > 18\n",
+        encoding="utf-8",
+    )
+    preparation = baseline.preparation.model_copy(
+        update={"fingerprint": RepositoryPreparer(load_trusted_case).fingerprint(repository)}
+    )
+    evidence = baseline.evidence
+    assert evidence is not None
+    changed = baseline.model_copy(
+        update={
+            "preparation": preparation,
+            "evidence": evidence.model_copy(
+                update={"stdout": evidence.stdout.replace(":5:", ":2:")}
+            ),
+        }
+    )
+
+    package = ContextSelector(load_trusted_case).select(changed, classify_failure(changed))
+
+    assert any(
+        item.path == PurePosixPath("src/eligibility/eligibility.py")
+        and "total / count" in item.content
+        for item in package.items
+    )
+
+
 @pytest.mark.parametrize(
     ("content", "reason"),
     [
@@ -735,9 +1066,19 @@ def test_generated_referenced_source_is_omitted(tmp_path: Path) -> None:
         PurePosixPath("../escape"),
         PurePosixPath("."),
         PurePosixPath("bad\\path"),
+        PurePosixPath("C:/absolute"),
+        PurePosixPath("C:drive-relative"),
     ],
 )
 def test_all_context_metadata_paths_reject_unsafe_forms(unsafe: PurePosixPath) -> None:
+    with pytest.raises(ValidationError):
+        ContextItem(
+            path=unsafe,
+            kind=ContextItemKind.SOURCE,
+            content="x",
+            priority=3,
+            original_utf8_bytes=1,
+        )
     with pytest.raises(ValidationError):
         ContextOmission(
             path=unsafe,
@@ -1023,6 +1364,45 @@ def test_static_selection_excludes_unrelated_sibling_method_dependencies(tmp_pat
     assert "import decimal" not in related
 
 
+def test_static_selection_excludes_names_shadowed_by_function_parameters(tmp_path: Path) -> None:
+    baseline = _prepared(tmp_path)
+    repository = baseline.preparation.prepared_repository
+    source = repository / "src/eligibility/eligibility.py"
+    source.write_text(
+        "import decimal\n\n"
+        "def helper() -> object:\n"
+        "    return decimal.Decimal('1')\n\n"
+        "def is_eligible(helper: int) -> bool:\n"
+        "    return helper > 18\n",
+        encoding="utf-8",
+    )
+    preparation = baseline.preparation.model_copy(
+        update={"fingerprint": RepositoryPreparer(load_trusted_case).fingerprint(repository)}
+    )
+    evidence = baseline.evidence
+    assert evidence is not None
+    changed = baseline.model_copy(
+        update={
+            "preparation": preparation,
+            "evidence": evidence.model_copy(
+                update={"stdout": evidence.stdout.replace(":5:", ":7:")}
+            ),
+        }
+    )
+
+    package = ContextSelector(load_trusted_case).select(changed, classify_failure(changed))
+    related = "\n".join(
+        item.content
+        for item in package.items
+        if item.kind
+        in {ContextItemKind.DEFINITION, ContextItemKind.TYPE_DEFINITION, ContextItemKind.IMPORT}
+    )
+
+    assert "def is_eligible" in related
+    assert "def helper" not in related
+    assert "import decimal" not in related
+
+
 def test_ast_syntax_failure_is_a_deterministic_optional_omission(tmp_path: Path) -> None:
     baseline = _prepared(tmp_path)
     repository = baseline.preparation.prepared_repository
@@ -1111,10 +1491,17 @@ def test_injected_source_read_failure_is_typed_as_an_omission(tmp_path: Path) ->
     source = baseline.preparation.prepared_repository / "src/eligibility/eligibility.py"
 
     class SourceReadFailureFilesystem(LocalContextFilesystem):
-        def read_bytes(self, path: Path, expected: os.stat_result) -> bytes:
-            if path == source:
+        def read_bytes(
+            self,
+            root: Path,
+            path: PurePosixPath,
+            expected_root: os.stat_result,
+            expected_directories: tuple[os.stat_result, ...],
+            expected: os.stat_result,
+        ) -> bytes:
+            if root.joinpath(*path.parts) == source:
                 raise OSError("injected read failure")
-            return super().read_bytes(path, expected)
+            return super().read_bytes(root, path, expected_root, expected_directories, expected)
 
     package = ContextSelector(load_trusted_case, filesystem=SourceReadFailureFilesystem()).select(
         baseline, classify_failure(baseline)
@@ -1134,8 +1521,22 @@ def test_malformed_loader_result_maps_to_typed_error(tmp_path: Path) -> None:
         return object()
 
     selector = ContextSelector(cast(TrustedCaseLoader, malformed_loader))
-    with pytest.raises(ContextSelectionError, match="case_load_failed"):
+    with pytest.raises(ContextSelectionError, match="case_load_failed") as error:
         selector.select(baseline, classify_failure(baseline))
+    assert error.value.__cause__ is None
+
+
+def test_loader_failure_does_not_chain_raw_sensitive_exception(tmp_path: Path) -> None:
+    baseline = _prepared(tmp_path)
+
+    def failing_loader(_: str) -> TrustedCase:
+        raise OSError("C:\\Users\\alice\\secret-token")
+
+    with pytest.raises(ContextSelectionError, match="case_load_failed") as error:
+        ContextSelector(failing_loader).select(baseline, classify_failure(baseline))
+
+    assert error.value.__cause__ is None
+    assert "alice" not in str(error.value)
 
 
 def test_malformed_nested_trusted_case_maps_to_typed_error(tmp_path: Path) -> None:
@@ -1143,8 +1544,9 @@ def test_malformed_nested_trusted_case_maps_to_typed_error(tmp_path: Path) -> No
     malformed = TrustedCase.model_construct(manifest=Manifest.model_construct())
 
     selector = ContextSelector(lambda _: malformed)
-    with pytest.raises(ContextSelectionError, match="case_load_failed"):
+    with pytest.raises(ContextSelectionError, match="case_load_failed") as error:
         selector.select(baseline, classify_failure(baseline))
+    assert error.value.__cause__ is None
 
 
 def test_malformed_baseline_maps_to_typed_context_errors(tmp_path: Path) -> None:
@@ -1186,6 +1588,11 @@ def test_all_fixture_layouts_are_selected_without_evaluator_content(
     baseline = _prepared(tmp_path, case_id)
     package = ContextSelector(load_trusted_case).select(baseline, classify_failure(baseline))
     combined = package.downstream_text().casefold()
+    _, source, _ = _FIXTURE_FRAMES[case_id]
     assert "reference.patch" not in combined
     assert "hidden_tests" not in combined
+    assert any(
+        item.path == PurePosixPath(source) and item.kind is ContextItemKind.SOURCE
+        for item in package.items
+    )
     assert all(isinstance(item.path, PurePosixPath) for item in package.items)
