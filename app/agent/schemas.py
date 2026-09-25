@@ -36,6 +36,11 @@ Confidence = Annotated[
     BeforeValidator(_require_float),
     Field(ge=0.0, le=1.0, allow_inf_nan=False),
 ]
+ModelTemperature = Annotated[
+    float,
+    BeforeValidator(_require_float),
+    Field(ge=0.0, le=2.0, allow_inf_nan=False),
+]
 
 
 class TestStatus(StrEnum):
@@ -69,6 +74,30 @@ class FailureCategory(StrEnum):
 class EvaluationStatus(StrEnum):
     passed = "passed"
     failed = "failed"
+
+
+class ModelOperation(StrEnum):
+    REPAIR_PLANNING = "repair_planning"
+    PATCH_GENERATION = "patch_generation"
+
+
+class ModelDiagnosticStage(StrEnum):
+    CONFIGURATION = "configuration"
+    PLANNING = "planning"
+    PATCH_GENERATION = "patch_generation"
+    STATE_UPDATE = "state_update"
+
+
+class ModelDiagnosticCode(StrEnum):
+    MISSING_CONFIGURATION = "missing_configuration"
+    INVALID_CONFIGURATION = "invalid_configuration"
+    UNSUPPORTED_PROMPT_VERSION = "unsupported_prompt_version"
+    INVALID_INPUT_STATE = "invalid_input_state"
+    PROVIDER_EXCEPTION = "provider_exception"
+    OVERSIZED_RESPONSE = "oversized_response"
+    MALFORMED_STRUCTURED_OUTPUT = "malformed_structured_output"
+    UNSUITABLE_AUTONOMOUS_REPAIR = "unsuitable_autonomous_repair"
+    INVALID_PATCH_ENVELOPE = "invalid_patch_envelope"
 
 
 class RevisionKind(StrEnum):
@@ -404,6 +433,42 @@ class ContextPackage(BaseModel):
         ):
             raise ValueError("protected-path policy is not represented in downstream context")
         return self
+
+
+class ModelConfiguration(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    provider: NonBlankString
+    model_name: NonBlankString
+    temperature: ModelTemperature
+    max_output_tokens: Annotated[int, Field(strict=True, ge=1, le=32_768)]
+    prompt_version: NonBlankString
+
+
+class ModelProviderRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    operation: ModelOperation
+    model_name: NonBlankString
+    temperature: ModelTemperature
+    max_output_tokens: Annotated[int, Field(strict=True, ge=1, le=32_768)]
+    prompt_version: NonBlankString
+    attempt_number: Annotated[int, Field(strict=True, ge=1, le=1)]
+    rendered_prompt: NonBlankString
+
+
+class ModelProviderResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    raw_json: str
+
+
+class ModelDiagnostic(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    stage: ModelDiagnosticStage
+    code: ModelDiagnosticCode
+    message: NonBlankString
 
 
 class RepairPlan(BaseModel):

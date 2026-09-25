@@ -4,15 +4,16 @@ TraceFix is an in-progress autonomous code-repair and evaluation platform for fa
 repositories. Its current foundation prepares deterministic benchmark snapshots, fingerprints their
 contents, reproduces known failures inside a hardened Docker sandbox, classifies captured
 pytest/Python evidence deterministically, and selects bounded model-safe context through static
-text and AST inspection. Typed Pydantic state provides the contracts for the repair workflow that
-follows.
+text and AST inspection. It can now pass that context through a typed, dependency-injected model
+boundary to produce a strictly validated repair plan and structurally validated inert patch
+proposal for the single v0.1 attempt.
 
-The broader platform will analyze failures, propose bounded patches, verify them, and present the
-result with reproducible evidence. Model-driven repair is not implemented yet.
+The broader platform will enforce patch policy, verify candidates, and present results with
+reproducible evidence. No generated patch is applied or executed at the current stage.
 
 ## Current Status
 
-The repository has completed the v0.1 foundation through Task 0.1.5:
+The repository has completed the v0.1 foundation through Task 0.1.6:
 
 - Python 3.14 packaging, CI, and deterministic quality tooling
 - strict Pydantic v2 schemas for repair state, results, plans, patches, and evaluations
@@ -30,11 +31,21 @@ The repository has completed the v0.1 foundation through Task 0.1.5:
   traceback-referenced source and static definitions/imports/types
 - evaluator, secret-bearing, generated, binary, invalid UTF-8, aliased, stale, and unrelated
   context exclusion with immutable protected-path metadata
+- strict frozen configuration for the five model and prompt environment variables, with no
+  defaults or credential handling
+- a typed dependency-injected model-provider protocol with no production fake, live adapter, SDK,
+  network call, streaming, tool call, or retry behavior
+- deterministic versioned planning and generation prompts that delimit the exact bounded context
+  as untrusted data and request schema-only JSON
+- strict `RepairPlan` and `PatchProposal` parsing, bounded provider output, safe typed diagnostics,
+  normalized path identities, and minimal unified-diff envelope validation
+- copy-on-update single-attempt state transitions through `plan_complete` and `patch_proposed`, with
+  provider/model/prompt identity recording
 - adversarial filesystem and sandbox security tests, including Linux TOCTOU regression coverage
 
 [`docs/progress.md`](docs/progress.md) is the source of truth for task completion and recorded
 validation evidence. It currently records no task as in progress. The next planned task in the
-execution plan is Task 0.1.6: repair planning and patch generation.
+execution plan is Task 0.1.7: deterministic patch-policy validation.
 
 ## Why TraceFix
 
@@ -61,17 +72,18 @@ benchmark case
   -> repository preparation and fingerprinting       [implemented]
   -> baseline failure reproduction                    [implemented]
   -> failure classification and relevant context      [implemented]
-  -> repair planning and patch generation             [roadmap]
+  -> repair planning and patch generation             [implemented]
   -> patch policy and static validation               [roadmap]
   -> sandbox verification                             [roadmap]
   -> evaluation and routing                           [roadmap]
 ```
 
-The current implementation deliberately stops after producing typed failure analysis and bounded
-static context. It does not call a model, plan a repair, or generate or apply patches. Later v0.1
-tasks add those parts of the local repair pipeline; v0.2 adds persistence, queue-backed workers,
-API ingress, and checkpoint recovery; v1.0 adds GitHub integration, human approval, and production
-observability.
+The current implementation deliberately stops after producing a structurally valid inert patch
+proposal. Model access is available only through an injected protocol; there is no production fake
+or live provider. The patch is not applied, policy-approved, statically checked, compiled,
+imported, executed, or treated as evidence of correctness. Later v0.1 tasks add those deterministic
+gates; v0.2 adds persistence, queue-backed workers, API ingress, and checkpoint recovery; v1.0 adds
+GitHub integration, human approval, and production observability.
 External systems are designed to sit behind typed adapters, and long-running work will run in
 workers rather than HTTP handlers once those layers exist.
 
@@ -91,16 +103,20 @@ TraceFix can currently:
 - execute only validated `python -m pytest` commands for declared visible test paths;
 - retain bounded stdout, stderr, truncation flags, exit status, duration, and completion evidence;
   classify recognized syntax, import, assertion, exception, type, timeout, and environment
-  evidence without using benchmark answers; and
+  evidence without using benchmark answers;
 - produce deterministic context under an exact 32,768-byte default limit while revalidating the
-  prepared fingerprint and evaluator boundary.
+  prepared fingerprint and evaluator boundary;
+- load strict model configuration from exactly five named environment variables and construct
+  deterministic `repair-v1.0` requests through an injected typed provider; and
+- produce a canonical repair plan and inert patch proposal with exact plan/proposal/diff path-set
+  agreement for attempt `1`.
 
 Current benchmark revisions are symbolic snapshot identities, not Git commit SHAs. Successful
 prepared workspaces are caller-owned and must be cleaned up after downstream work completes.
 
-TraceFix does not yet plan, generate, or apply repairs, call a model provider, execute a LangGraph
-workflow, expose a CLI or API, persist jobs, run a queue, integrate with GitHub, or report repair
-success rates.
+TraceFix does not yet provide a production model adapter, apply patches, enforce full patch policy,
+run static or sandbox candidate verification, execute a LangGraph workflow, expose a CLI or API,
+persist jobs, run a queue, integrate with GitHub, or report repair success rates.
 
 ## Quick Start
 
@@ -148,6 +164,11 @@ mounts. Host secrets, credentials, proxy configuration, Docker configuration, th
 developer home directories are not exposed. Resource and returned-output limits are typed and
 bounded, and containers are forcibly terminated on timeout and removed after every outcome.
 
+Repository context, repair plans, provider responses, and generated diffs are untrusted data. Model
+responses are byte-bounded before strict JSON parsing, diagnostics do not expose prompts, context,
+raw responses, exception text, credentials, or host paths, and generated diffs remain inert. The
+model boundary receives no filesystem, command, Docker, credential, or network capability.
+
 Linux is the production-supported host for adversarial repository preparation and execution.
 Windows is development-supported, but native Windows does not claim complete host-side TOCTOU
 protection during repository preparation. Running Linux containers through Docker Desktop does not
@@ -180,7 +201,8 @@ real-model benchmark execution exists.
 
 ## Repository Structure
 
-- [`app/`](app/) — typed agent state, repository preparation, baseline execution, and Docker adapter
+- [`app/`](app/) — typed agent state, model boundary, planning, repository preparation, baseline
+  execution, and Docker adapter
 - [`benchmarks/`](benchmarks/) — deterministic development fixtures and trusted/model-safe loaders
 - [`tests/`](tests/) — unit, Docker integration, filesystem, and adversarial security tests
 - [`docs/architecture/`](docs/architecture/) — target architecture and security boundaries
@@ -190,9 +212,8 @@ real-model benchmark execution exists.
 
 ## Roadmap
 
-- **Remaining v0.1:** plan and generate patches, enforce patch policy, verify candidates, route
-  outcomes, add a local CLI, and separate deterministic fake-model integration from live-model
-  evaluation.
+- **Remaining v0.1:** enforce patch policy, verify candidates, route outcomes, add a local CLI, and
+  separate deterministic fake-model integration from live-model evaluation.
 - **v0.2:** add PostgreSQL-backed state, queue workers, FastAPI ingress, LangGraph checkpointing,
   recovery, bounded retries, and expanded evaluation.
 - **v1.0:** add GitHub App workflows, human approval, observability, resilience hardening, and
