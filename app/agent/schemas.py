@@ -305,6 +305,29 @@ class ContextOmission(BaseModel):
         return self
 
 
+DEFAULT_PROTECTED_PATHS = tuple(
+    PurePosixPath(value)
+    for value in sorted(
+        (
+            ".github/workflows",
+            "authentication",
+            "authorization",
+            "deployment",
+            "docker",
+            "infra",
+            "migrations",
+            "security",
+            "secrets",
+            "terraform",
+            "Pipfile.lock",
+            "poetry.lock",
+            "uv.lock",
+        ),
+        key=str.casefold,
+    )
+)
+
+
 class ProtectedPathPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 

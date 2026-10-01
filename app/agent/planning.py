@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import json
-import re
 from contextlib import suppress
 from datetime import UTC, datetime
-from pathlib import PurePosixPath, PureWindowsPath
 from typing import NoReturn
 
 from pydantic import ValidationError
@@ -15,6 +13,7 @@ from app.agent.model import (
     ModelDiagnosticError,
     ModelProvider,
 )
+from app.agent.patches import normalize_repository_paths, parse_unified_diff
 from app.agent.schemas import (
     BaselineOutcome,
     BaselineResult,
@@ -33,10 +32,6 @@ from app.agent.schemas import (
 )
 
 MAX_PROVIDER_RESPONSE_UTF8_BYTES = 1_048_576
-_HUNK_HEADER = re.compile(
-    r"^@@ -(?:0|[1-9][0-9]*)(?:,(?P<old_count>[0-9]+))? "
-    r"\+(?:0|[1-9][0-9]*)(?:,(?P<new_count>[0-9]+))? @@(?: .*)?$"
-)
 
 
 def _raise_diagnostic(
@@ -87,37 +82,6 @@ def _validated_context(context: ContextPackage, stage: ModelDiagnosticStage) -> 
     return validated
 
 
-def _normalized_repository_paths(paths: list[str]) -> tuple[str, ...]:
-    if not paths:
-        raise ValueError("at least one repository path is required")
-    normalized: list[str] = []
-    identities: set[str] = set()
-    for value in paths:
-        if type(value) is not str:
-            raise ValueError("repository path must be a string")
-        windows = PureWindowsPath(value)
-        candidate = PurePosixPath(value)
-        parts = value.split("/")
-        if (
-            not value
-            or "\x00" in value
-            or "\\" in value
-            or any(ord(character) < 32 for character in value)
-            or windows.drive
-            or windows.root
-            or candidate.is_absolute()
-            or any(part in {"", ".", ".."} for part in parts)
-            or candidate.as_posix() != value
-        ):
-            raise ValueError("repository path is not normalized and relative")
-        identity = value.casefold()
-        if identity in identities:
-            raise ValueError("repository paths contain a case-fold alias")
-        identities.add(identity)
-        normalized.append(value)
-    return tuple(normalized)
-
-
 def _validated_plan(
     plan: RepairPlan,
     stage: ModelDiagnosticStage,
@@ -128,7 +92,7 @@ def _validated_plan(
         if not isinstance(plan, RepairPlan):
             raise TypeError("repair plan has the wrong type")
         validated = RepairPlan.model_validate(plan.model_dump(), strict=True)
-        _normalized_repository_paths(validated.files_expected_to_change)
+        normalize_repository_paths(validated.files_expected_to_change)
     except (AttributeError, TypeError, ValueError, ValidationError):
         validated = None
     if validated is None:
@@ -249,7 +213,16 @@ def _provider_json(
             ModelDiagnosticCode.MALFORMED_STRUCTURED_OUTPUT,
             "model provider returned malformed structured output",
         )
-    if len(validated.raw_json.encode("utf-8")) > MAX_PROVIDER_RESPONSE_UTF8_BYTES:
+    response_size: int | None = None
+    with suppress(UnicodeEncodeError):
+        response_size = len(validated.raw_json.encode("utf-8"))
+    if response_size is None:
+        _raise_diagnostic(
+            stage,
+            ModelDiagnosticCode.MALFORMED_STRUCTURED_OUTPUT,
+            "model provider returned malformed structured output",
+        )
+    if response_size > MAX_PROVIDER_RESPONSE_UTF8_BYTES:
         _raise_diagnostic(
             stage,
             ModelDiagnosticCode.OVERSIZED_RESPONSE,
@@ -275,110 +248,18 @@ def _parse_plan(raw_json: str) -> RepairPlan:
     )
 
 
-def _diff_header_path(value: str, prefix: str) -> str | None:
-    if value == "/dev/null":
-        return None
-    if not value.startswith(prefix):
-        raise ValueError("unified diff header has an unsupported prefix")
-    path = value[len(prefix) :]
-    return _normalized_repository_paths([path])[0]
-
-
-def _diff_changed_paths(unified_diff: str) -> tuple[str, tuple[str, ...]]:
-    if "\x00" in unified_diff:
-        raise ValueError("unified diff contains NUL")
-    normalized = unified_diff.replace("\r\n", "\n").replace("\r", "\n")
-    lines = normalized.split("\n")
-    changed: list[str] = []
-    identities: set[str] = set()
-    current_has_hunk = False
-    current_exists = False
-    old_remaining: int | None = None
-    new_remaining: int | None = None
-    index = 0
-    while index < len(lines):
-        line = lines[index]
-        if old_remaining is not None and new_remaining is not None:
-            if old_remaining == 0 and new_remaining == 0:
-                old_remaining = None
-                new_remaining = None
-                continue
-            if line == r"\ No newline at end of file":
-                index += 1
-                continue
-            if line.startswith(" "):
-                old_remaining -= 1
-                new_remaining -= 1
-            elif line.startswith("-"):
-                old_remaining -= 1
-            elif line.startswith("+"):
-                new_remaining -= 1
-            else:
-                raise ValueError("unified diff contains malformed hunk content")
-            if old_remaining < 0 or new_remaining < 0:
-                raise ValueError("unified diff hunk line counts disagree")
-            index += 1
-            continue
-        if line.startswith("--- "):
-            paired = index + 1 < len(lines) and lines[index + 1].startswith("+++ ")
-            if current_exists and not current_has_hunk:
-                raise ValueError("unified diff file has no hunk")
-            if not paired:
-                raise ValueError("unified diff file headers are not paired")
-            old = _diff_header_path(line[4:], "a/")
-            new = _diff_header_path(lines[index + 1][4:], "b/")
-            if old is None and new is None:
-                raise ValueError("unified diff cannot pair two null files")
-            if old is not None and new is not None and old != new:
-                raise ValueError("unified diff file headers disagree")
-            changed_path = old if old is not None else new
-            if changed_path is None:
-                raise ValueError("unified diff has no changed path")
-            identity = changed_path.casefold()
-            if identity in identities:
-                raise ValueError("unified diff contains a duplicate file identity")
-            identities.add(identity)
-            changed.append(changed_path)
-            current_exists = True
-            current_has_hunk = False
-            index += 2
-            continue
-        if (line.startswith("+++ ") or line.startswith("---") or line.startswith("+++")) and (
-            old_remaining is None or new_remaining is None
-        ):
-            raise ValueError("unified diff contains an unsupported header")
-        if line.startswith("@@"):
-            match = _HUNK_HEADER.fullmatch(line)
-            if not current_exists or match is None:
-                raise ValueError("unified diff contains a malformed hunk")
-            current_has_hunk = True
-            old_count = match.group("old_count")
-            new_count = match.group("new_count")
-            old_remaining = 1 if old_count is None else int(old_count)
-            new_remaining = 1 if new_count is None else int(new_count)
-        elif line.startswith((" ", "-", "+")) or line == r"\ No newline at end of file":
-            raise ValueError("unified diff contains content outside a hunk")
-        index += 1
-    if old_remaining == 0 and new_remaining == 0:
-        old_remaining = None
-        new_remaining = None
-    if old_remaining is not None or new_remaining is not None:
-        raise ValueError("unified diff hunk line counts disagree")
-    if not current_exists or not current_has_hunk:
-        raise ValueError("unified diff must contain a file pair and hunk")
-    return normalized, tuple(changed)
-
-
 def _validated_patch(proposal: PatchProposal, plan: RepairPlan) -> PatchProposal:
     validated: PatchProposal | None = None
     try:
-        proposal_paths = _normalized_repository_paths(proposal.files_changed)
-        plan_paths = _normalized_repository_paths(plan.files_expected_to_change)
-        normalized_diff, diff_paths = _diff_changed_paths(proposal.unified_diff)
-        if set(proposal_paths) != set(plan_paths) or set(proposal_paths) != set(diff_paths):
+        proposal_paths = normalize_repository_paths(proposal.files_changed)
+        plan_paths = normalize_repository_paths(plan.files_expected_to_change)
+        parsed_diff = parse_unified_diff(proposal.unified_diff)
+        if set(proposal_paths) != set(plan_paths) or set(proposal_paths) != set(
+            parsed_diff.changed_paths
+        ):
             raise ValueError("plan, proposal, and diff paths disagree")
         values = proposal.model_dump()
-        values["unified_diff"] = normalized_diff
+        values["unified_diff"] = parsed_diff.normalized_text
         validated = PatchProposal.model_validate(values, strict=True)
     except (AttributeError, TypeError, ValueError, ValidationError):
         pass

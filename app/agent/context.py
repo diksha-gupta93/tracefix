@@ -22,6 +22,7 @@ from app.agent.classification import (
 )
 from app.agent.preparation import PreparationError, RepositoryPreparer
 from app.agent.schemas import (
+    DEFAULT_PROTECTED_PATHS,
     BaselineOutcome,
     BaselineResult,
     ContextItem,
@@ -69,27 +70,7 @@ _SECRET_CONTENT = (
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
 )
 
-_PROTECTED = tuple(
-    PurePosixPath(value)
-    for value in sorted(
-        (
-            ".github/workflows",
-            "authentication",
-            "authorization",
-            "deployment",
-            "docker",
-            "infra",
-            "migrations",
-            "security",
-            "secrets",
-            "terraform",
-            "Pipfile.lock",
-            "poetry.lock",
-            "uv.lock",
-        ),
-        key=str.casefold,
-    )
-)
+_PROTECTED = DEFAULT_PROTECTED_PATHS
 
 
 def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:

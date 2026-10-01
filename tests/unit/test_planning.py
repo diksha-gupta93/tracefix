@@ -572,6 +572,36 @@ def test_provider_response_utf8_limit_is_enforced_before_json_parsing(multibyte:
     )
 
 
+@pytest.mark.parametrize(
+    "operation", [ModelOperation.REPAIR_PLANNING, ModelOperation.PATCH_GENERATION]
+)
+def test_invalid_unicode_provider_response_is_safe_malformed_output(
+    operation: ModelOperation,
+) -> None:
+    malformed = "\ud800"
+    provider = QueueProvider(ModelProviderResponse(raw_json=malformed))
+
+    with pytest.raises(ModelDiagnosticError) as raised:
+        if operation is ModelOperation.REPAIR_PLANNING:
+            plan_repair(context_package(), configuration(), provider)
+        else:
+            generate_patch(context_package(), repair_plan(), configuration(), provider)
+
+    expected_stage = (
+        ModelDiagnosticStage.PLANNING
+        if operation is ModelOperation.REPAIR_PLANNING
+        else ModelDiagnosticStage.PATCH_GENERATION
+    )
+    assert_diagnostic(
+        raised,
+        expected_stage,
+        ModelDiagnosticCode.MALFORMED_STRUCTURED_OUTPUT,
+    )
+    assert malformed not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
 def test_provider_response_exactly_at_utf8_limit_is_accepted() -> None:
     values = repair_plan().model_dump()
     values["suspected_root_cause"] = "x"

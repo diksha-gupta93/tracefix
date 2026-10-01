@@ -6,14 +6,15 @@ contents, reproduces known failures inside a hardened Docker sandbox, classifies
 pytest/Python evidence deterministically, and selects bounded model-safe context through static
 text and AST inspection. It can now pass that context through a typed, dependency-injected model
 boundary to produce a strictly validated repair plan and structurally validated inert patch
-proposal for the single v0.1 attempt.
+proposal for the single v0.1 attempt. A deterministic typed patch-policy gate now rejects
+out-of-scope or unsafe proposals before any candidate processing.
 
-The broader platform will enforce patch policy, verify candidates, and present results with
-reproducible evidence. No generated patch is applied or executed at the current stage.
+The broader platform will verify candidates and present results with reproducible evidence. No
+generated patch is applied or executed at the current stage, including after policy approval.
 
 ## Current Status
 
-The repository has completed the v0.1 foundation through Task 0.1.6:
+The repository has completed the v0.1 foundation through Task 0.1.7:
 
 - Python 3.14 packaging, CI, and deterministic quality tooling
 - strict Pydantic v2 schemas for repair state, results, plans, patches, and evaluations
@@ -41,11 +42,17 @@ The repository has completed the v0.1 foundation through Task 0.1.6:
   normalized path identities, and minimal unified-diff envelope validation
 - copy-on-update single-attempt state transitions through `plan_complete` and `patch_proposed`, with
   provider/model/prompt identity recording
+- pure, deterministic patch-policy validation with fixed limits of three changed files and 200
+  added-plus-removed hunk lines
+- aggregated, deduplicated, stably ordered typed violations for protected paths, binary or secret
+  content, test/assertion manipulation, CI/security changes, direct process execution,
+  dependencies, and evaluator/benchmark/reference material
+- distinct fail-closed typed diagnostics for malformed policy, proposal, path, and diff input
 - adversarial filesystem and sandbox security tests, including Linux TOCTOU regression coverage
 
 [`docs/progress.md`](docs/progress.md) is the source of truth for task completion and recorded
 validation evidence. It currently records no task as in progress. The next planned task in the
-execution plan is Task 0.1.7: deterministic patch-policy validation.
+execution plan is Task 0.1.8: patch application and static validation.
 
 ## Why TraceFix
 
@@ -73,17 +80,20 @@ benchmark case
   -> baseline failure reproduction                    [implemented]
   -> failure classification and relevant context      [implemented]
   -> repair planning and patch generation             [implemented]
-  -> patch policy and static validation               [roadmap]
+  -> patch policy                                      [implemented]
+  -> patch application and static validation           [roadmap]
   -> sandbox verification                             [roadmap]
   -> evaluation and routing                           [roadmap]
 ```
 
-The current implementation deliberately stops after producing a structurally valid inert patch
-proposal. Model access is available only through an injected protocol; there is no production fake
-or live provider. The patch is not applied, policy-approved, statically checked, compiled,
-imported, executed, or treated as evidence of correctness. Later v0.1 tasks add those deterministic
-gates; v0.2 adds persistence, queue-backed workers, API ingress, and checkpoint recovery; v1.0 adds
-GitHub integration, human approval, and production observability.
+The current implementation deliberately stops after deterministic policy inspection of a
+structurally valid inert patch proposal. Model access is available only through an injected
+protocol; there is no production fake or live provider. Policy approval is necessary but does not
+mean that the patch applies, compiles, passes tests, or is correct. The patch is not applied,
+statically checked, compiled, imported, executed, or treated as evidence of correctness. Later
+v0.1 tasks add those deterministic gates; v0.2 adds persistence, queue-backed workers, API ingress,
+and checkpoint recovery; v1.0 adds GitHub integration, human approval, and production
+observability.
 External systems are designed to sit behind typed adapters, and long-running work will run in
 workers rather than HTTP handlers once those layers exist.
 
@@ -109,14 +119,17 @@ TraceFix can currently:
 - load strict model configuration from exactly five named environment variables and construct
   deterministic `repair-v1.0` requests through an injected typed provider; and
 - produce a canonical repair plan and inert patch proposal with exact plan/proposal/diff path-set
-  agreement for attempt `1`.
+  agreement for attempt `1`; and
+- inspect a proposal entirely in memory against immutable protected and forbidden paths, the fixed
+  v0.1 size limits, high-confidence local content signatures, an empty-by-default dependency
+  allowlist, and evaluator isolation rules, returning only safe typed metadata.
 
 Current benchmark revisions are symbolic snapshot identities, not Git commit SHAs. Successful
 prepared workspaces are caller-owned and must be cleaned up after downstream work completes.
 
-TraceFix does not yet provide a production model adapter, apply patches, enforce full patch policy,
-run static or sandbox candidate verification, execute a LangGraph workflow, expose a CLI or API,
-persist jobs, run a queue, integrate with GitHub, or report repair success rates.
+TraceFix does not yet provide a production model adapter, apply patches, run static or sandbox
+candidate verification, execute a LangGraph workflow, expose a CLI or API, persist jobs, run a
+queue, integrate with GitHub, or report repair success rates.
 
 ## Quick Start
 
@@ -166,8 +179,11 @@ bounded, and containers are forcibly terminated on timeout and removed after eve
 
 Repository context, repair plans, provider responses, and generated diffs are untrusted data. Model
 responses are byte-bounded before strict JSON parsing, diagnostics do not expose prompts, context,
-raw responses, exception text, credentials, or host paths, and generated diffs remain inert. The
-model boundary receives no filesystem, command, Docker, credential, or network capability.
+raw responses, exception text, credentials, or host paths, and generated diffs remain inert. Patch
+policy revalidates the proposal and policy, normalizes paths and line endings, reports every safely
+detectable violation without retaining matched content, and uses no filesystem, environment,
+network, process, Docker, or candidate-execution capability. The model boundary receives no
+filesystem, command, Docker, credential, or network capability.
 
 Linux is the production-supported host for adversarial repository preparation and execution.
 Windows is development-supported, but native Windows does not claim complete host-side TOCTOU
@@ -212,8 +228,8 @@ real-model benchmark execution exists.
 
 ## Roadmap
 
-- **Remaining v0.1:** enforce patch policy, verify candidates, route outcomes, add a local CLI, and
-  separate deterministic fake-model integration from live-model evaluation.
+- **Remaining v0.1:** apply and verify candidates, route outcomes, add a local CLI, and separate
+  deterministic fake-model integration from live-model evaluation.
 - **v0.2:** add PostgreSQL-backed state, queue workers, FastAPI ingress, LangGraph checkpointing,
   recovery, bounded retries, and expanded evaluation.
 - **v1.0:** add GitHub App workflows, human approval, observability, resilience hardening, and
