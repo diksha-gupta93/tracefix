@@ -4,3 +4,7 @@ docker/*
 !docker/sandbox/
 docker/sandbox/*
 !docker/sandbox/Dockerfile
+!docker/static-checks/
+docker/static-checks/*
+!docker/static-checks/Dockerfile
+!docker/static-checks/runner.py

@@ -23,5 +23,7 @@ jobs:
         run: python -m pip install --editable ".[dev]"
       - name: Build sandbox image
         run: docker build --tag tracefix-sandbox:0.1.3a --file docker/sandbox/Dockerfile .
+      - name: Build static-check image
+        run: docker build --tag tracefix-static-checks:0.1.8 --file docker/static-checks/Dockerfile .
       - name: Validate
         run: python scripts/check.py

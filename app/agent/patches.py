@@ -29,11 +29,25 @@ class ParsedDiffLine:
 
 
 @dataclass(frozen=True, slots=True)
+class ParsedDiffHunk:
+    old_start: int
+    old_count: int
+    new_start: int
+    new_count: int
+    lines: tuple[ParsedDiffLine, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ParsedDiffFile:
     path: str
     old_path: str | None
     new_path: str | None
     lines: tuple[ParsedDiffLine, ...]
+    hunks: tuple[ParsedDiffHunk, ...]
+    old_no_final_newline: bool
+    new_no_final_newline: bool
+    old_no_final_newline_line: int | None
+    new_no_final_newline_line: int | None
 
     @property
     def is_added(self) -> bool:
@@ -48,6 +62,7 @@ class ParsedDiffFile:
 class ParsedUnifiedDiff:
     normalized_text: str
     files: tuple[ParsedDiffFile, ...]
+    has_ignored_content: bool
 
     @property
     def changed_paths(self) -> tuple[str, ...]:
@@ -73,7 +88,12 @@ class _FileBuilder:
     old_path: str | None
     new_path: str | None
     lines: list[ParsedDiffLine] = field(default_factory=list)
+    hunks: list[_HunkBuilder] = field(default_factory=list)
     has_hunk: bool = False
+    old_no_final_newline: bool = False
+    new_no_final_newline: bool = False
+    old_no_final_newline_line: int | None = None
+    new_no_final_newline_line: int | None = None
 
     def freeze(self) -> ParsedDiffFile:
         return ParsedDiffFile(
@@ -81,7 +101,46 @@ class _FileBuilder:
             old_path=self.old_path,
             new_path=self.new_path,
             lines=tuple(self.lines),
+            hunks=tuple(hunk.freeze() for hunk in self.hunks),
+            old_no_final_newline=self.old_no_final_newline,
+            new_no_final_newline=self.new_no_final_newline,
+            old_no_final_newline_line=self.old_no_final_newline_line,
+            new_no_final_newline_line=self.new_no_final_newline_line,
         )
+
+
+@dataclass(slots=True)
+class _HunkBuilder:
+    old_start: int
+    old_count: int
+    new_start: int
+    new_count: int
+    lines: list[ParsedDiffLine] = field(default_factory=list)
+
+    def freeze(self) -> ParsedDiffHunk:
+        return ParsedDiffHunk(
+            old_start=self.old_start,
+            old_count=self.old_count,
+            new_start=self.new_start,
+            new_count=self.new_count,
+            lines=tuple(self.lines),
+        )
+
+
+def _record_no_newline_marker(current: _FileBuilder | None) -> None:
+    if current is None or not current.lines:
+        raise UnifiedDiffError("unified diff contains a misplaced no-newline marker")
+    kind = current.lines[-1].kind
+    mark_old = kind in {DiffLineKind.CONTEXT, DiffLineKind.REMOVED}
+    mark_new = kind in {DiffLineKind.CONTEXT, DiffLineKind.ADDED}
+    if (mark_old and current.old_no_final_newline) or (mark_new and current.new_no_final_newline):
+        raise UnifiedDiffError("unified diff repeats a no-newline marker")
+    if mark_old:
+        current.old_no_final_newline = True
+        current.old_no_final_newline_line = current.lines[-1].old_line
+    if mark_new:
+        current.new_no_final_newline = True
+        current.new_no_final_newline_line = current.lines[-1].new_line
 
 
 def normalize_repository_paths(paths: Sequence[str]) -> tuple[str, ...]:
@@ -202,6 +261,8 @@ def parse_unified_diff(unified_diff: str) -> ParsedUnifiedDiff:
     new_remaining: int | None = None
     old_line = 0
     new_line = 0
+    current_hunk: _HunkBuilder | None = None
+    has_ignored_content = False
     index = 0
     while index < len(lines):
         line = lines[index]
@@ -210,31 +271,33 @@ def parse_unified_diff(unified_diff: str) -> ParsedUnifiedDiff:
                 old_remaining = None
                 new_remaining = None
                 if line == r"\ No newline at end of file":
+                    _record_no_newline_marker(current)
                     index += 1
                 continue
             if line == r"\ No newline at end of file":
+                _record_no_newline_marker(current)
                 index += 1
                 continue
-            if current is None:
+            if current is None or current_hunk is None:
                 raise UnifiedDiffError("unified diff contains malformed hunk content")
             if line.startswith(" "):
-                current.lines.append(
-                    ParsedDiffLine(DiffLineKind.CONTEXT, line[1:], old_line, new_line)
-                )
+                parsed_line = ParsedDiffLine(DiffLineKind.CONTEXT, line[1:], old_line, new_line)
                 old_remaining -= 1
                 new_remaining -= 1
                 old_line += 1
                 new_line += 1
             elif line.startswith("-"):
-                current.lines.append(ParsedDiffLine(DiffLineKind.REMOVED, line[1:], old_line, None))
+                parsed_line = ParsedDiffLine(DiffLineKind.REMOVED, line[1:], old_line, None)
                 old_remaining -= 1
                 old_line += 1
             elif line.startswith("+"):
-                current.lines.append(ParsedDiffLine(DiffLineKind.ADDED, line[1:], None, new_line))
+                parsed_line = ParsedDiffLine(DiffLineKind.ADDED, line[1:], None, new_line)
                 new_remaining -= 1
                 new_line += 1
             else:
                 raise UnifiedDiffError("unified diff contains malformed hunk content")
+            current.lines.append(parsed_line)
+            current_hunk.lines.append(parsed_line)
             if old_remaining < 0 or new_remaining < 0:
                 raise UnifiedDiffError("unified diff hunk line counts disagree")
             index += 1
@@ -268,8 +331,17 @@ def parse_unified_diff(unified_diff: str) -> ParsedUnifiedDiff:
             if (old_remaining > 0 and old_line == 0) or (new_remaining > 0 and new_line == 0):
                 raise UnifiedDiffError("unified diff hunk has an invalid zero start")
             current.has_hunk = True
+            current_hunk = _HunkBuilder(
+                old_start=old_line,
+                old_count=old_remaining,
+                new_start=new_line,
+                new_count=new_remaining,
+            )
+            current.hunks.append(current_hunk)
         elif line.startswith((" ", "-", "+")) or line == r"\ No newline at end of file":
             raise UnifiedDiffError("unified diff contains content outside a hunk")
+        elif line:
+            has_ignored_content = True
         index += 1
     if old_remaining == 0 and new_remaining == 0:
         old_remaining = None
@@ -278,4 +350,8 @@ def parse_unified_diff(unified_diff: str) -> ParsedUnifiedDiff:
         raise UnifiedDiffError("unified diff hunk line counts disagree")
     if current is None or not current.has_hunk:
         raise UnifiedDiffError("unified diff must contain a file pair and hunk")
-    return ParsedUnifiedDiff(normalized, tuple(file.freeze() for file in files))
+    return ParsedUnifiedDiff(
+        normalized,
+        tuple(file.freeze() for file in files),
+        has_ignored_content,
+    )

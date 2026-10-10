@@ -7,14 +7,17 @@ pytest/Python evidence deterministically, and selects bounded model-safe context
 text and AST inspection. It can now pass that context through a typed, dependency-injected model
 boundary to produce a strictly validated repair plan and structurally validated inert patch
 proposal for the single v0.1 attempt. A deterministic typed patch-policy gate now rejects
-out-of-scope or unsafe proposals before any candidate processing.
+out-of-scope or unsafe proposals before a deterministic static-validation gate applies an approved
+patch to a fresh candidate and runs compilation, AST parsing, Ruff, strict mypy, and Bandit in a
+dedicated hardened container.
 
-The broader platform will verify candidates and present results with reproducible evidence. No
-generated patch is applied or executed at the current stage, including after policy approval.
+The broader platform will execute candidate tests and present results with reproducible evidence.
+A static pass is blocking prerequisite evidence only; it is not functional verification or proof
+that a repair is correct or secure.
 
 ## Current Status
 
-The repository has completed the v0.1 foundation through Task 0.1.7:
+The repository has completed the v0.1 foundation through Task 0.1.8:
 
 - Python 3.14 packaging, CI, and deterministic quality tooling
 - strict Pydantic v2 schemas for repair state, results, plans, patches, and evaluations
@@ -48,11 +51,20 @@ The repository has completed the v0.1 foundation through Task 0.1.7:
   content, test/assertion manipulation, CI/security changes, direct process execution,
   dependencies, and evaluator/benchmark/reference material
 - distinct fail-closed typed diagnostics for malformed policy, proposal, path, and diff input
+- exact, atomic UTF-8 text patch application for modifications, additions, and deletions, with no
+  offset search, fuzz, path stripping, Git invocation, or partial publication
+- byte-level changed-file validation before and after static tooling, preserving the prepared
+  snapshot and publishing only a fully passing candidate
+- fixed-order compilation, AST, Ruff, strict-mypy, and Bandit checks in the dedicated
+  `tracefix-static-checks:0.1.8` image, with candidate configuration and suppressions disabled or
+  rejected
+- strict safe results that distinguish deterministic candidate findings from Docker, tool,
+  protocol, filesystem-integrity, and cleanup diagnostics
 - adversarial filesystem and sandbox security tests, including Linux TOCTOU regression coverage
 
 [`docs/progress.md`](docs/progress.md) is the source of truth for task completion and recorded
 validation evidence. It currently records no task as in progress. The next planned task in the
-execution plan is Task 0.1.8: patch application and static validation.
+execution plan is Task 0.1.9: sandbox candidate verification.
 
 ## Why TraceFix
 
@@ -81,19 +93,19 @@ benchmark case
   -> failure classification and relevant context      [implemented]
   -> repair planning and patch generation             [implemented]
   -> patch policy                                      [implemented]
-  -> patch application and static validation           [roadmap]
+  -> patch application and static validation           [implemented]
   -> sandbox verification                             [roadmap]
   -> evaluation and routing                           [roadmap]
 ```
 
-The current implementation deliberately stops after deterministic policy inspection of a
-structurally valid inert patch proposal. Model access is available only through an injected
-protocol; there is no production fake or live provider. Policy approval is necessary but does not
-mean that the patch applies, compiles, passes tests, or is correct. The patch is not applied,
-statically checked, compiled, imported, executed, or treated as evidence of correctness. Later
-v0.1 tasks add those deterministic gates; v0.2 adds persistence, queue-backed workers, API ingress,
-and checkpoint recovery; v1.0 adds GitHub integration, human approval, and production
-observability.
+The current implementation deliberately stops after deterministic static validation of a
+policy-approved patch. Model access is available only through an injected protocol; there is no
+production fake or live provider. Policy approval is necessary but not sufficient: the static gate
+revalidates the preparation and proposal, applies the diff exactly in a private staging copy,
+proves the changed-file set, and publishes only a candidate that passes every applicable check.
+Candidate tests are not run yet, so a static pass is not repair success. Later v0.1 tasks add
+sandbox verification and routing; v0.2 adds persistence, queue-backed workers, API ingress, and
+checkpoint recovery; v1.0 adds GitHub integration, human approval, and production observability.
 External systems are designed to sit behind typed adapters, and long-running work will run in
 workers rather than HTTP handlers once those layers exist.
 
@@ -122,14 +134,20 @@ TraceFix can currently:
   agreement for attempt `1`; and
 - inspect a proposal entirely in memory against immutable protected and forbidden paths, the fixed
   v0.1 size limits, high-confidence local content signatures, an empty-by-default dependency
-  allowlist, and evaluator isolation rules, returning only safe typed metadata.
+  allowlist, and evaluator isolation rules, returning only safe typed metadata;
+- apply an approved modification/addition/deletion diff with exact coordinates, contexts, removed
+  lines, UTF-8 and LF/CRLF semantics in a fresh private candidate copy;
+- prove the actual added/modified/deleted byte set equals both the proposal and parsed diff before
+  and after analysis; and
+- run all surviving changed `.py` and `.pyi` files through Python 3.14 compilation and AST parsing,
+  isolated Ruff, strict mypy, and Bandit in a fixed-command hardened container.
 
 Current benchmark revisions are symbolic snapshot identities, not Git commit SHAs. Successful
 prepared workspaces are caller-owned and must be cleaned up after downstream work completes.
 
-TraceFix does not yet provide a production model adapter, apply patches, run static or sandbox
-candidate verification, execute a LangGraph workflow, expose a CLI or API, persist jobs, run a
-queue, integrate with GitHub, or report repair success rates.
+TraceFix does not yet provide a production model adapter, run candidate tests or hidden tests,
+execute a LangGraph workflow, expose a CLI or API, persist jobs, run a queue, integrate with GitHub,
+or report repair success rates.
 
 ## Quick Start
 
@@ -144,6 +162,7 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install --editable ".[dev]"
 docker build --tag tracefix-sandbox:0.1.3a --file docker/sandbox/Dockerfile .
+docker build --tag tracefix-static-checks:0.1.8 --file docker/static-checks/Dockerfile .
 python scripts/check.py
 ```
 
@@ -160,8 +179,8 @@ python scripts/check.py
 
 It runs Ruff formatting checks, Ruff linting, strict mypy checks, and pytest. The pytest suite
 includes the applicable Docker integration and adversarial security tests. Local Docker tests skip
-only when the Docker CLI or a usable Linux-container daemon is unavailable; CI builds the sandbox
-image first and executes the integration suite. A reachable daemon without seccomp support, or a
+only when the Docker CLI or a usable Linux-container daemon is unavailable; CI builds both fixed
+images first and executes the integration suite. A reachable daemon without seccomp support, or a
 missing required image when Docker is usable, is a failure.
 
 Recorded milestone results belong in [`docs/progress.md`](docs/progress.md), not in manually
@@ -176,6 +195,14 @@ default seccomp profile, and uses a read-only root filesystem with only explicit
 mounts. Host secrets, credentials, proxy configuration, Docker configuration, the Docker socket, and
 developer home directories are not exposed. Resource and returned-output limits are typed and
 bounded, and containers are forcibly terminated on timeout and removed after every outcome.
+
+Static validation never compiles or analyzes candidate Python on the host. Host code only copies,
+hashes, compares, and transforms inert bytes in a fresh contained staging tree. The dedicated
+static image receives a read-only candidate mount and normalized changed Python paths only, copies
+the candidate into tmpfs, and invokes fixed tool argument sequences with no shell. Candidate Ruff,
+mypy, and Bandit configuration, plugins, caches, baselines, inline Ruff/Bandit suppressions, and
+mypy suppression directives cannot change the gate. Raw tool output and source text are discarded;
+cross-module findings retain only bounded normalized path, location, and rule metadata.
 
 Repository context, repair plans, provider responses, and generated diffs are untrusted data. Model
 responses are byte-bounded before strict JSON parsing, diagnostics do not expose prompts, context,
@@ -228,7 +255,7 @@ real-model benchmark execution exists.
 
 ## Roadmap
 
-- **Remaining v0.1:** apply and verify candidates, route outcomes, add a local CLI, and separate
+- **Remaining v0.1:** execute candidate tests, route outcomes, add a local CLI, and separate
   deterministic fake-model integration from live-model evaluation.
 - **v0.2:** add PostgreSQL-backed state, queue workers, FastAPI ingress, LangGraph checkpointing,
   recovery, bounded retries, and expanded evaluation.
