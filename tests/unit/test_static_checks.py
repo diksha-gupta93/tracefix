@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 from pathlib import Path
 
 import pytest
@@ -1177,6 +1178,31 @@ def test_local_filesystem_identity_preserves_normal_copy_write_publish_flow(
     assert filesystem.snapshot(published, published_identity) == candidate
     filesystem.remove_tree(published, published_identity)
     assert not published.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission behavior")
+def test_local_filesystem_candidate_is_readable_by_non_owner_container(tmp_path: Path) -> None:
+    filesystem = LocalStaticFilesystem()
+    source = tmp_path / "source"
+    workspace = tmp_path / "workspace"
+    source.mkdir()
+    workspace.mkdir()
+    _write_source(source)
+    staging = workspace / "staging"
+
+    identity = filesystem.make_directory(staging)
+    filesystem.copy_snapshot(filesystem.snapshot(source), staging, identity)
+    filesystem.write_file(staging, identity, "new/package.py", b"value = 1\n", create=True)
+
+    for directory in (staging, staging / "src", staging / "new"):
+        mode = directory.stat().st_mode
+        assert mode & stat.S_IROTH
+        assert mode & stat.S_IXOTH
+        assert not mode & stat.S_IWOTH
+    for file in (staging / "src" / "example.py", staging / "new" / "package.py"):
+        mode = file.stat().st_mode
+        assert mode & stat.S_IROTH
+        assert not mode & stat.S_IWOTH
 
 
 def test_write_rejects_root_replaced_by_filesystem_alias(tmp_path: Path) -> None:
