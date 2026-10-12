@@ -428,7 +428,7 @@ class LocalStaticFilesystem:
                 except FileNotFoundError:
                     if not create_directories:
                         raise
-                    os.mkdir(part, 0o700, dir_fd=descriptor)
+                    os.mkdir(part, 0o755, dir_fd=descriptor)
                     next_descriptor = os.open(part, self._directory_flags(), dir_fd=descriptor)
                 opened = os.fstat(next_descriptor)
                 if not stat.S_ISDIR(opened.st_mode) or getattr(opened, "st_reparse_tag", False):
@@ -591,7 +591,7 @@ class LocalStaticFilesystem:
             else:
                 parent = self._open_root(path.parent, parent_identity)
                 try:
-                    os.mkdir(path.name, 0o700, dir_fd=parent)
+                    os.mkdir(path.name, 0o755, dir_fd=parent)
                     descriptor = os.open(path.name, self._directory_flags(), dir_fd=parent)
                     try:
                         identity = _directory_identity(os.fstat(descriptor))
@@ -633,14 +633,14 @@ class LocalStaticFilesystem:
                     )
                     try:
                         if entry.kind is _EntryKind.DIRECTORY:
-                            os.mkdir(name, 0o700, dir_fd=parent)
+                            os.mkdir(name, 0o755, dir_fd=parent)
                         else:
                             if entry.data is None:
                                 raise OSError
                             descriptor = os.open(
                                 name,
                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                                0o600,
+                                0o644,
                                 dir_fd=parent,
                             )
                             with os.fdopen(descriptor, "wb") as stream:
@@ -681,7 +681,7 @@ class LocalStaticFilesystem:
                 flags = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
                 flags |= os.O_CREAT | os.O_EXCL if create else 0
                 try:
-                    descriptor = os.open(name, flags, 0o600, dir_fd=parent)
+                    descriptor = os.open(name, flags, 0o644, dir_fd=parent)
                 finally:
                     os.close(parent)
             try:
