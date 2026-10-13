@@ -11,6 +11,15 @@ from app.sandbox.runner import (
     SandboxValidationError,
     SubprocessDockerCommandAdapter,
 )
+from app.sandbox.verification_runner import (
+    HiddenTestBundle,
+    VerificationRunnerError,
+    VerificationRunnerErrorCode,
+    VerificationRunnerValidationError,
+    VerificationSandboxBoundary,
+    VerificationSandboxEvidence,
+    VerificationSandboxRunner,
+)
 
 __all__ = [
     "DockerCommandAdapter",
@@ -26,4 +35,11 @@ __all__ = [
     "SandboxRunner",
     "SandboxValidationError",
     "SubprocessDockerCommandAdapter",
+    "HiddenTestBundle",
+    "VerificationRunnerError",
+    "VerificationRunnerErrorCode",
+    "VerificationRunnerValidationError",
+    "VerificationSandboxBoundary",
+    "VerificationSandboxEvidence",
+    "VerificationSandboxRunner",
 ]

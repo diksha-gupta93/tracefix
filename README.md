@@ -9,15 +9,17 @@ boundary to produce a strictly validated repair plan and structurally validated 
 proposal for the single v0.1 attempt. A deterministic typed patch-policy gate now rejects
 out-of-scope or unsafe proposals before a deterministic static-validation gate applies an approved
 patch to a fresh candidate and runs compilation, AST parsing, Ruff, strict mypy, and Bandit in a
-dedicated hardened container.
+dedicated hardened container. Passing candidates are now verified in fixed increasing scope inside
+the hardened pytest sandbox and evaluated with deterministic functional, patch-size, execution-
+duration, and optional supplied model-usage metrics.
 
-The broader platform will execute candidate tests and present results with reproducible evidence.
-A static pass is blocking prerequisite evidence only; it is not functional verification or proof
-that a repair is correct or secure.
+The broader platform will route those results and present them as reproducible run artifacts. A
+static pass remains blocking prerequisite evidence only; functional success requires targeted,
+full-visible, and hidden verification to pass.
 
 ## Current Status
 
-The repository has completed the v0.1 foundation through Task 0.1.8:
+The repository has completed the v0.1 foundation through Task 0.1.9:
 
 - Python 3.14 packaging, CI, and deterministic quality tooling
 - strict Pydantic v2 schemas for repair state, results, plans, patches, and evaluations
@@ -61,10 +63,16 @@ The repository has completed the v0.1 foundation through Task 0.1.8:
 - strict safe results that distinguish deterministic candidate findings from Docker, tool,
   protocol, filesystem-integrity, and cleanup diagnostics
 - adversarial filesystem and sandbox security tests, including Linux TOCTOU regression coverage
+- fixed-order candidate verification against targeted, complete-visible, and trusted hidden tests
+- private hidden-only evaluator bundles mounted read-only and removed after every outcome
+- safe verification evidence that discards raw test and Docker output and distinguishes functional
+  failure from timeout, OOM, integrity, Docker, protocol, evaluator, and cleanup diagnostics
+- deterministic candidate evaluation with ordered changed files, added/removed line counts,
+  executed sandbox duration, and nullable exact model latency/token/Decimal-USD values
 
 [`docs/progress.md`](docs/progress.md) is the source of truth for task completion and recorded
 validation evidence. It currently records no task as in progress. The next planned task in the
-execution plan is Task 0.1.9: sandbox candidate verification.
+execution plan is Task 0.1.10a: graph routing and CLI wiring.
 
 ## Why TraceFix
 
@@ -94,18 +102,19 @@ benchmark case
   -> repair planning and patch generation             [implemented]
   -> patch policy                                      [implemented]
   -> patch application and static validation           [implemented]
-  -> sandbox verification                             [roadmap]
-  -> evaluation and routing                           [roadmap]
+  -> sandbox verification                              [implemented]
+  -> deterministic candidate evaluation                [implemented]
+  -> routing and local artifacts                        [roadmap]
 ```
 
-The current implementation deliberately stops after deterministic static validation of a
-policy-approved patch. Model access is available only through an injected protocol; there is no
-production fake or live provider. Policy approval is necessary but not sufficient: the static gate
-revalidates the preparation and proposal, applies the diff exactly in a private staging copy,
-proves the changed-file set, and publishes only a candidate that passes every applicable check.
-Candidate tests are not run yet, so a static pass is not repair success. Later v0.1 tasks add
-sandbox verification and routing; v0.2 adds persistence, queue-backed workers, API ingress, and
-checkpoint recovery; v1.0 adds GitHub integration, human approval, and production observability.
+The current implementation deliberately stops after deterministic candidate evaluation. Model
+access is available only through an injected protocol; there is no production fake or live
+provider. Policy approval and static validation are necessary but not sufficient: a candidate is
+successful only when targeted, full-visible, and hidden verification all pass. Verification owns
+only its temporary hidden-test bundle; the published candidate remains read-only and caller-owned
+for later routing and artifact creation. Later v0.1 tasks add graph routing and local artifacts;
+v0.2 adds persistence, queue-backed workers, API ingress, and checkpoint recovery; v1.0 adds GitHub
+integration, human approval, and production observability.
 External systems are designed to sit behind typed adapters, and long-running work will run in
 workers rather than HTTP handlers once those layers exist.
 
@@ -140,14 +149,21 @@ TraceFix can currently:
 - prove the actual added/modified/deleted byte set equals both the proposal and parsed diff before
   and after analysis; and
 - run all surviving changed `.py` and `.pyi` files through Python 3.14 compilation and AST parsing,
-  isolated Ruff, strict mypy, and Bandit in a fixed-command hardened container.
+  isolated Ruff, strict mypy, and Bandit in a fixed-command hardened container;
+- verify candidates in targeted, full-visible, then hidden order with deterministic
+  short-circuiting and identity/fingerprint checks before, between, and after execution;
+- copy only declared hidden-test bytes into deterministic private names, mount the bundle
+  read-only, discard raw output, and clean up the bundle while leaving the candidate untouched; and
+- purely evaluate functional outcome, changed paths, added/removed lines, executed sandbox
+  duration, and optional supplied model latency, token counts, and exact USD cost. Missing
+  measurements remain `null`, while zero remains a valid observation.
 
 Current benchmark revisions are symbolic snapshot identities, not Git commit SHAs. Successful
 prepared workspaces are caller-owned and must be cleaned up after downstream work completes.
 
-TraceFix does not yet provide a production model adapter, run candidate tests or hidden tests,
-execute a LangGraph workflow, expose a CLI or API, persist jobs, run a queue, integrate with GitHub,
-or report repair success rates.
+TraceFix does not yet provide a production model adapter, execute a LangGraph workflow, expose a
+CLI or API, write run artifacts, persist jobs, run a queue, integrate with GitHub, aggregate
+benchmark reports, or report live-model repair success rates.
 
 ## Quick Start
 
@@ -196,6 +212,15 @@ mounts. Host secrets, credentials, proxy configuration, Docker configuration, th
 developer home directories are not exposed. Resource and returned-output limits are typed and
 bounded, and containers are forcibly terminated on timeout and removed after every outcome.
 
+Candidate verification likewise never executes candidate or test code on the host. Visible stages
+mount only the validated candidate. The hidden stage creates a fresh bundle containing only the
+loader-declared hidden-test bytes under TraceFix-owned names and mounts it read-only at a fixed
+path; it never mounts the evaluator directory, manifest, reference patch, benchmark root, project
+root, home directory, credentials, or Docker socket. Candidate identity and content fingerprints
+are checked around execution. Raw visible/hidden output, Docker output, exception text, and paths
+do not cross the verification adapter. Timeout, OOM, integrity, Docker, protocol, evaluator, and
+cleanup failures remain infrastructure diagnostics rather than functional repair failures.
+
 Static validation never compiles or analyzes candidate Python on the host. Host code only copies,
 hashes, compares, and transforms inert bytes in a fresh contained staging tree. The dedicated
 static image receives a read-only candidate mount and normalized changed Python paths only, copies
@@ -238,9 +263,11 @@ repositories may not. The current integration suite verifies that all five decla
 failures reproduce inside the real sandbox while fixture sources remain unchanged.
 
 This is deterministic platform and integration testing: it answers whether preparation, isolation,
-execution, and evidence handling behave correctly. Future live-model evaluation will separately
-measure repair capability, latency, token use, and cost. No repair success rate is reported until
-real-model benchmark execution exists.
+verification, and evidence handling behave correctly. Candidate evaluation reparses the inert diff
+for deterministic files and added/removed counts, sums only executed verification-stage duration,
+and preserves optional trusted upstream model measurements without pricing or provider access.
+Future live-model evaluation will separately measure repair capability. No repair success rate is
+reported until real-model benchmark execution exists.
 
 ## Repository Structure
 
