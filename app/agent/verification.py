@@ -716,8 +716,6 @@ class LocalEvaluatorBundleFilesystem:
             or not stat.S_ISDIR(metadata.st_mode)
         ):
             raise BundleCleanupError
-        if os.name != "nt":
-            root.chmod(0o700)
         for path in root.iterdir():
             child = path.lstat()
             if (
@@ -728,6 +726,8 @@ class LocalEvaluatorBundleFilesystem:
                 or child.st_nlink != 1
             ):
                 raise BundleCleanupError
+        if os.name != "nt":
+            root.chmod(0o700)
         shutil.rmtree(root)
 
 

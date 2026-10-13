@@ -4,6 +4,7 @@ import os
 import shutil
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -827,6 +828,38 @@ def test_bundle_cleanup_rejects_symlink_without_mutating_target(tmp_path: Path) 
     child.unlink()
     child.write_bytes(original_bytes)
     filesystem.remove_bundle(bundle)
+    assert not bundle.root.exists()
+
+
+def test_rejected_bundle_cleanup_does_not_change_root_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _relocated_case(tmp_path)
+    workspace = (tmp_path / "verification").resolve()
+    workspace.mkdir()
+    if os.name != "nt":
+        workspace.chmod(0o700)
+    filesystem = LocalEvaluatorBundleFilesystem()
+    bundle = filesystem.create_bundle(workspace, case, "d" * 32)
+    unexpected = bundle.root / "unexpected.txt"
+    unexpected.write_text("unchanged", encoding="utf-8")
+    chmod_calls: list[tuple[Path, int]] = []
+
+    def record_chmod(path: Path, mode: int, *, follow_symlinks: bool = True) -> None:
+        del follow_symlinks
+        chmod_calls.append((path, mode))
+
+    monkeypatch.setattr("app.agent.verification.os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(Path, "chmod", record_chmod)
+
+    with pytest.raises(BundleCleanupError):
+        filesystem.remove_bundle(bundle)
+
+    assert chmod_calls == []
+    assert unexpected.read_text(encoding="utf-8") == "unchanged"
+    unexpected.unlink()
+    filesystem.remove_bundle(bundle)
+    assert chmod_calls == [(bundle.root, 0o700)]
     assert not bundle.root.exists()
 
 
