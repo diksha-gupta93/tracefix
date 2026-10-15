@@ -11,15 +11,16 @@ out-of-scope or unsafe proposals before a deterministic static-validation gate a
 patch to a fresh candidate and runs compilation, AST parsing, Ruff, strict mypy, and Bandit in a
 dedicated hardened container. Passing candidates are now verified in fixed increasing scope inside
 the hardened pytest sandbox and evaluated with deterministic functional, patch-size, execution-
-duration, and optional supplied model-usage metrics.
+duration, and optional supplied model-usage metrics. A synchronous eleven-node LangGraph now
+routes one repair attempt to a deterministic local outcome, and the installed CLI publishes a
+safe metadata-only run artifact.
 
-The broader platform will route those results and present them as reproducible run artifacts. A
-static pass remains blocking prerequisite evidence only; functional success requires targeted,
+A static pass remains blocking prerequisite evidence only; functional success requires targeted,
 full-visible, and hidden verification to pass.
 
 ## Current Status
 
-The repository has completed the v0.1 foundation through Task 0.1.9:
+The repository has completed the v0.1 foundation through Task 0.1.10a:
 
 - Python 3.14 packaging, CI, and deterministic quality tooling
 - strict Pydantic v2 schemas for repair state, results, plans, patches, and evaluations
@@ -69,10 +70,14 @@ The repository has completed the v0.1 foundation through Task 0.1.9:
   failure from timeout, OOM, integrity, Docker, protocol, evaluator, and cleanup diagnostics
 - deterministic candidate evaluation with ordered changed files, added/removed line counts,
   executed sandbox duration, and nullable exact model latency/token/Decimal-USD values
+- an in-memory, single-attempt LangGraph with eleven named nodes, explicit terminal short circuits,
+  no retry edge, and seven fixed terminal outcomes
+- `tracefix repair <case_id>` with preflight case validation, stable exit codes, graph-owned private
+  workspaces, deterministic safe artifacts, and an empty production provider registry
 
 [`docs/progress.md`](docs/progress.md) is the source of truth for task completion and recorded
 validation evidence. It currently records no task as in progress. The next planned task in the
-execution plan is Task 0.1.10a: graph routing and CLI wiring.
+execution plan is Task 0.1.10b: deterministic fake-provider integration.
 
 ## Why TraceFix
 
@@ -104,17 +109,16 @@ benchmark case
   -> patch application and static validation           [implemented]
   -> sandbox verification                              [implemented]
   -> deterministic candidate evaluation                [implemented]
-  -> routing and local artifacts                        [roadmap]
+  -> routing and local artifacts                        [implemented]
 ```
 
-The current implementation deliberately stops after deterministic candidate evaluation. Model
-access is available only through an injected protocol; there is no production fake or live
-provider. Policy approval and static validation are necessary but not sufficient: a candidate is
-successful only when targeted, full-visible, and hidden verification all pass. Verification owns
-only its temporary hidden-test bundle; the published candidate remains read-only and caller-owned
-for later routing and artifact creation. Later v0.1 tasks add graph routing and local artifacts;
-v0.2 adds persistence, queue-backed workers, API ingress, and checkpoint recovery; v1.0 adds GitHub
-integration, human approval, and production observability.
+The current implementation stops after one routed local attempt. Model access is available only
+through an injected protocol; there is no production fake or live provider. Policy approval and
+static validation are necessary but not sufficient: a candidate is successful only when targeted,
+full-visible, and hidden verification all pass. The graph has no checkpointer, persistence, retry,
+or resume behavior. Task 0.1.10b adds the deterministic production fake provider; Task 0.1.11a adds
+the live-provider benchmark boundary. v0.2 adds persistence, queue-backed workers, API ingress, and
+checkpoint recovery; v1.0 adds GitHub integration, human approval, and production observability.
 External systems are designed to sit behind typed adapters, and long-running work will run in
 workers rather than HTTP handlers once those layers exist.
 
@@ -161,9 +165,8 @@ TraceFix can currently:
 Current benchmark revisions are symbolic snapshot identities, not Git commit SHAs. Successful
 prepared workspaces are caller-owned and must be cleaned up after downstream work completes.
 
-TraceFix does not yet provide a production model adapter, execute a LangGraph workflow, expose a
-CLI or API, write run artifacts, persist jobs, run a queue, integrate with GitHub, aggregate
-benchmark reports, or report live-model repair success rates.
+TraceFix does not yet provide a production fake or live model adapter, API, persistent jobs, queue,
+GitHub integration, benchmark aggregation, retries, or live-model repair success rates.
 
 ## Quick Start
 
@@ -184,6 +187,48 @@ python scripts/check.py
 
 On POSIX systems, activate the environment with `. .venv/bin/activate`; the remaining commands are
 the same. After setup, use the existing `.venv` rather than creating another runtime environment.
+
+## Local Repair Command
+
+The installed public command is exactly:
+
+```text
+tracefix repair <case_id>
+```
+
+The command validates malformed and unknown case IDs before creating a workspace, loading model
+configuration, invoking Docker, or writing an artifact. Task 0.1.10a intentionally registers no
+production provider. A known case with valid provider-shaped configuration but no registered
+implementation therefore produces a safe `infrastructure_failure` artifact without a model network
+call. Task 0.1.10b will register the deterministic fake provider; live access remains Task 0.1.11a.
+
+Completed known-case runs print one summary and write
+`.tracefix/artifacts/<case_id>-<run_id>.json` relative to the invocation directory. The versioned
+artifact contains only safe structured metadata: identities and UTC timestamps, the terminal route,
+baseline completion metadata, failure category, policy/static metadata, safe verification evidence,
+and candidate evaluation metrics when available. It explicitly excludes source/context content,
+model prompts and raw responses, proposal prose and diff, stdout/stderr, raw Docker/tool output,
+hidden-test names or content, reference material, exception text, environment values, credentials,
+secrets, and absolute paths. Publication is exclusive and atomic; an existing destination is never
+overwritten.
+
+Each run owns one private temporary root with separate preparation, candidate, and verification
+areas. The trees remain available through routing and artifact projection, then the complete owned
+root is removed on success, every terminal failure, and interruption. Cleanup uncertainty changes
+the result to `infrastructure_failure`.
+
+| Exit code | Outcome |
+| ---: | --- |
+| 0 | `success` |
+| 1 | `candidate_failure` |
+| 2 | CLI syntax/input error, including an unknown case |
+| 3 | `policy_violation` |
+| 4 | `static_check_failure` |
+| 5 | `baseline_not_reproducible` |
+| 6 | `infrastructure_failure`, cleanup failure, or artifact-publication failure |
+| 7 | `malformed_model_output` |
+
+`KeyboardInterrupt` retains the conventional process exit code `130` after best-effort cleanup.
 
 ## Validation
 
@@ -237,6 +282,13 @@ detectable violation without retaining matched content, and uses no filesystem, 
 network, process, Docker, or candidate-execution capability. The model boundary receives no
 filesystem, command, Docker, credential, or network capability.
 
+Graph routing revalidates every typed handoff and binds policy, static validation, verification, and
+evaluation to the generated proposal identity. Baseline non-reproduction bypasses the model and all
+candidate nodes; policy rejection bypasses patch application; static failure bypasses verification;
+all well-formed verification outcomes are evaluated before routing. Artifacts serialize an explicit
+allowlist rather than the graph state. Workspace cleanup validates the exact recorded owner identity
+before recursively removing only the run-owned temporary root.
+
 Linux is the production-supported host for adversarial repository preparation and execution.
 Windows is development-supported, but native Windows does not claim complete host-side TOCTOU
 protection during repository preparation. Running Linux containers through Docker Desktop does not
@@ -282,8 +334,8 @@ reported until real-model benchmark execution exists.
 
 ## Roadmap
 
-- **Remaining v0.1:** execute candidate tests, route outcomes, add a local CLI, and separate
-  deterministic fake-model integration from live-model evaluation.
+- **Remaining v0.1:** add deterministic fake-provider end-to-end integration and keep it separate
+  from live-model evaluation.
 - **v0.2:** add PostgreSQL-backed state, queue workers, FastAPI ingress, LangGraph checkpointing,
   recovery, bounded retries, and expanded evaluation.
 - **v1.0:** add GitHub App workflows, human approval, observability, resilience hardening, and
