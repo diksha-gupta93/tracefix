@@ -117,12 +117,12 @@ class LocalWorkspaceManager:
         if _RUN_ID.fullmatch(run_id) is None or run_id in self._owned:
             raise WorkspaceError("workspace run identity is invalid")
         base: Path | None = None
-        if self._base_directory is not None:
-            base = self._base_directory.absolute()
-            _workspace_metadata(base)
         root_value: str | None = None
         root_identity: tuple[int, int, int] | None = None
         try:
+            if self._base_directory is not None:
+                base = self._base_directory.absolute()
+                _workspace_metadata(base)
             root_value = tempfile.mkdtemp(
                 prefix=f"tracefix-run-{run_id}-",
                 dir=None if base is None else os.fspath(base),

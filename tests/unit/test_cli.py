@@ -105,6 +105,12 @@ def test_workspace_manager_rejects_aliased_base(tmp_path: Path) -> None:
         LocalWorkspaceManager(alias).create("f" * 32)
 
 
+def test_workspace_manager_normalizes_base_validation_failure(tmp_path: Path) -> None:
+    missing_base = tmp_path / "missing-workspace-base"
+    with pytest.raises(WorkspaceError, match="creation failed"):
+        LocalWorkspaceManager(missing_base).create("f" * 32)
+
+
 def test_empty_provider_registry_has_no_fallback() -> None:
     from app.agent.schemas import ModelConfiguration
 
