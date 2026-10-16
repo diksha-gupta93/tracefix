@@ -291,6 +291,7 @@ def test_create_environment_and_mounts_are_fixed(
 ) -> None:
     monkeypatch.setenv("TRACEFIX_SYNTHETIC_SECRET", "must-not-cross-boundary")
     monkeypatch.setenv("HTTPS_PROXY", "http://must-not-cross-boundary")
+    monkeypatch.setenv("PYTHONPATH", "host-path-must-not-cross-boundary")
     adapter = FakeDockerAdapter(
         [completed(), completed(), completed(stdout=b"0\n"), state(), completed()]
     )
@@ -302,10 +303,15 @@ def test_create_environment_and_mounts_are_fixed(
         create[index + 1] for index, value in enumerate(create) if value == "--env"
     )
     mounts = tuple(create[index + 1] for index, value in enumerate(create) if value == "--mount")
-    assert environments == ("PYTHONDONTWRITEBYTECODE=1", "PYTHONUNBUFFERED=1")
+    assert environments == (
+        "PYTHONDONTWRITEBYTECODE=1",
+        "PYTHONUNBUFFERED=1",
+        "PYTHONPATH=/tracefix/workspace/repository/src",
+    )
     assert len(mounts) == 3
     assert sum(mount.startswith("type=bind,") for mount in mounts) == 1
     assert "must-not-cross-boundary" not in "\0".join(create)
+    assert "host-path-must-not-cross-boundary" not in "\0".join(create)
 
 
 def test_constructs_fixed_container_and_maps_result(tmp_path: Path) -> None:

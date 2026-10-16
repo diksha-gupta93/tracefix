@@ -65,4 +65,8 @@ def test_prepares_copy_and_reproduces_visible_failure(case: TrustedCase, tmp_pat
     assert result.evidence is not None
     assert result.evidence.completion is SandboxCompletion.NORMAL
     assert result.evidence.exit_code is not None and result.evidence.exit_code != 0
+    combined = "\n".join((result.evidence.stdout, result.evidence.stderr))
+    assert "ModuleNotFoundError" not in combined
+    assert "ImportError" not in combined
+    assert f"{case.manifest.visible_tests[0]}::" in combined
     assert _tree_digest(case.case_path) == source_before

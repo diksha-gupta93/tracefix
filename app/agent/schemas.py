@@ -471,6 +471,10 @@ class ModelConfiguration(BaseModel):
 class ModelProviderRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
+    case_id: Annotated[
+        str,
+        Field(strict=True, pattern=r"^[a-z0-9][a-z0-9_-]{0,127}$", max_length=128),
+    ]
     operation: ModelOperation
     model_name: NonBlankString
     temperature: ModelTemperature

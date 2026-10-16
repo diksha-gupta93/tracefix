@@ -112,15 +112,15 @@ benchmark case
   -> routing and local artifacts                        [implemented]
 ```
 
-The current implementation stops after one routed local attempt. Model access is available only
-through an injected protocol; there is no production fake or live provider. Policy approval and
-static validation are necessary but not sufficient: a candidate is successful only when targeted,
-full-visible, and hidden verification all pass. The graph has no checkpointer, persistence, retry,
-or resume behavior. Task 0.1.10b adds the deterministic production fake provider; Task 0.1.11a adds
-the live-provider benchmark boundary. v0.2 adds persistence, queue-backed workers, API ingress, and
-checkpoint recovery; v1.0 adds GitHub integration, human approval, and production observability.
-External systems are designed to sit behind typed adapters, and long-running work will run in
-workers rather than HTTP handlers once those layers exist.
+The current implementation stops after one routed local attempt. Model access remains behind an
+injected protocol, with one production-composed deterministic local fake provider and no live
+provider. Policy approval and static validation are necessary but not sufficient: a candidate is
+successful only when targeted, full-visible, and hidden verification all pass. The graph has no
+checkpointer, persistence, retry, or resume behavior. Task 0.1.11a adds the live-provider benchmark
+boundary. v0.2 adds persistence, queue-backed workers, API ingress, and checkpoint recovery; v1.0
+adds GitHub integration, human approval, and production observability. External systems are
+designed to sit behind typed adapters, and long-running work will run in workers rather than HTTP
+handlers once those layers exist.
 
 See the [system architecture](docs/architecture/tracefix-system-architecture.md) for the target
 component model, trust boundaries, and versioned evolution.
@@ -143,6 +143,9 @@ TraceFix can currently:
   prepared fingerprint and evaluator boundary;
 - load strict model configuration from exactly five named environment variables and construct
   deterministic `repair-v1.0` requests through an injected typed provider; and
+- resolve the explicitly configured `tracefix-fake` provider to immutable, predetermined plan and
+  patch responses for all five development cases without credentials or model-provider network
+  access;
 - produce a canonical repair plan and inert patch proposal with exact plan/proposal/diff path-set
   agreement for attempt `1`; and
 - inspect a proposal entirely in memory against immutable protected and forbidden paths, the fixed
@@ -165,8 +168,8 @@ TraceFix can currently:
 Current benchmark revisions are symbolic snapshot identities, not Git commit SHAs. Successful
 prepared workspaces are caller-owned and must be cleaned up after downstream work completes.
 
-TraceFix does not yet provide a production fake or live model adapter, API, persistent jobs, queue,
-GitHub integration, benchmark aggregation, retries, or live-model repair success rates.
+TraceFix does not yet provide a live model adapter, API, persistent jobs, queue, GitHub integration,
+benchmark aggregation, retries, or live-model repair success rates.
 
 ## Quick Start
 
@@ -197,10 +200,28 @@ tracefix repair <case_id>
 ```
 
 The command validates malformed and unknown case IDs before creating a workspace, loading model
-configuration, invoking Docker, or writing an artifact. Task 0.1.10a intentionally registers no
-production provider. A known case with valid provider-shaped configuration but no registered
-implementation therefore produces a safe `infrastructure_failure` artifact without a model network
-call. Task 0.1.10b will register the deterministic fake provider; live access remains Task 0.1.11a.
+configuration, invoking Docker, or writing an artifact. To run any of the five development cases
+through the local deterministic provider and the complete eleven-node pipeline, set exactly:
+
+```text
+MODEL_PROVIDER=tracefix-fake
+MODEL_NAME=tracefix-deterministic-v1
+MODEL_TEMPERATURE=0
+MODEL_MAX_TOKENS=4096
+PROMPT_VERSION=repair-v1.0
+```
+
+The fake provider accepts no alternate profile. It uses explicit project-owned responses keyed by
+case ID, prompt version, and attempt number; it does not parse prompts, read benchmark/evaluator
+files at runtime, require model credentials, or make provider network calls. An unknown provider or
+unsupported fake profile follows the existing safe `infrastructure_failure` route. Live provider
+and benchmark support remains deferred to Task 0.1.11a.
+
+For identical valid requests, fake response bytes are stable. Across complete runs, the terminal
+route, exit code, changed-file and line-count evidence, stage outcomes, and provider/model/prompt
+identity are stable. Run IDs, timestamps, measured durations, temporary paths, and artifact
+filenames are intentionally volatile and are validated for shape and internal consistency instead
+of byte equality.
 
 Completed known-case runs print one summary and write
 `.tracefix/artifacts/<case_id>-<run_id>.json` relative to the invocation directory. The versioned
@@ -301,7 +322,8 @@ documented in the [system architecture](docs/architecture/tracefix-system-archit
 
 ## Benchmark / Evaluation Approach
 
-The development benchmark contains five small, deterministic Python defects:
+The development benchmark contains five small, deterministic Python defects, all of which can now
+run end to end through `tracefix repair <case_id>` with the configured fake provider:
 
 - `boundary_condition`
 - `exception_handling`
@@ -314,12 +336,13 @@ and a reference patch. Trusted loaders may access evaluator material; model-safe
 repositories may not. The current integration suite verifies that all five declared visible
 failures reproduce inside the real sandbox while fixture sources remain unchanged.
 
-This is deterministic platform and integration testing: it answers whether preparation, isolation,
-verification, and evidence handling behave correctly. Candidate evaluation reparses the inert diff
-for deterministic files and added/removed counts, sums only executed verification-stage duration,
-and preserves optional trusted upstream model measurements without pricing or provider access.
-Future live-model evaluation will separately measure repair capability. No repair success rate is
-reported until real-model benchmark execution exists.
+This is deterministic platform and integration testing: it answers whether preparation,
+classification, model-boundary handling, patch enforcement, isolation, verification, evaluation,
+artifact publication, and cleanup behave correctly. It does not measure or claim live-model repair
+capability. Candidate evaluation reparses the inert diff for deterministic files and added/removed
+counts, sums only executed verification-stage duration, and preserves optional trusted upstream
+model measurements without pricing or provider access. Future live-model evaluation will separately
+measure repair capability. No live-model repair success rate is reported until that boundary exists.
 
 ## Repository Structure
 
@@ -334,8 +357,8 @@ reported until real-model benchmark execution exists.
 
 ## Roadmap
 
-- **Remaining v0.1:** add deterministic fake-provider end-to-end integration and keep it separate
-  from live-model evaluation.
+- **Remaining v0.1:** add the Task 0.1.11a live-provider benchmark boundary while keeping it
+  separate from deterministic fake-provider platform validation.
 - **v0.2:** add PostgreSQL-backed state, queue workers, FastAPI ingress, LangGraph checkpointing,
   recovery, bounded retries, and expanded evaluation.
 - **v1.0:** add GitHub App workflows, human approval, observability, resilience hardening, and

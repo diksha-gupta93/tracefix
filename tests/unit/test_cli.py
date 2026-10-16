@@ -13,6 +13,7 @@ from app.cli import (
     ProviderRegistry,
     RepairApplication,
     WorkspaceError,
+    default_application_factory,
     main,
 )
 from benchmarks.loader import BenchmarkLoadError, load_trusted_case
@@ -122,6 +123,32 @@ def test_empty_provider_registry_has_no_fallback() -> None:
         prompt_version="repair-v1.0",
     )
     assert ProviderRegistry().resolve(configuration) is None
+
+
+def test_default_application_factory_registers_only_deterministic_fake() -> None:
+    from app.agent.schemas import ModelConfiguration
+    from app.evaluation.deterministic.fake_model import DeterministicFakeModelProvider
+
+    application = default_application_factory()
+    registry = application._dependencies.provider_registry
+    configuration = ModelConfiguration(
+        provider="tracefix-fake",
+        model_name="tracefix-deterministic-v1",
+        temperature=0.0,
+        max_output_tokens=4096,
+        prompt_version="repair-v1.0",
+    )
+
+    assert tuple(registry._factories) == ("tracefix-fake",)
+    assert isinstance(registry.resolve(configuration), DeterministicFakeModelProvider)
+    assert registry.resolve(configuration.model_copy(update={"provider": "unknown"})) is None
+    for field, value in (
+        ("model_name", "other"),
+        ("temperature", 0.5),
+        ("max_output_tokens", 2048),
+        ("prompt_version", "other"),
+    ):
+        assert registry.resolve(configuration.model_copy(update={field: value})) is None
 
 
 def test_keyboard_interrupt_maps_to_130() -> None:

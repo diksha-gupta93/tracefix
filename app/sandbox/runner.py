@@ -28,7 +28,11 @@ _CONTAINER_INPUT = "/tracefix/input"
 _CONTAINER_WORKSPACE = "/tracefix/workspace"
 _CONTAINER_TEMP = "/tmp"
 _CONTAINER_USER = "10001:10001"
-_FIXED_ENVIRONMENT = ("PYTHONDONTWRITEBYTECODE=1", "PYTHONUNBUFFERED=1")
+_FIXED_ENVIRONMENT = (
+    "PYTHONDONTWRITEBYTECODE=1",
+    "PYTHONUNBUFFERED=1",
+    "PYTHONPATH=/tracefix/workspace/repository/src",
+)
 _INFRASTRUCTURE_OUTPUT_LIMIT = 65_536
 _FORBIDDEN_PATH_CHARACTERS = frozenset("*?[]{};&|<>`$!()\"'")
 _CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
@@ -525,6 +529,8 @@ class SandboxRunner:
             _FIXED_ENVIRONMENT[0],
             "--env",
             _FIXED_ENVIRONMENT[1],
+            "--env",
+            _FIXED_ENVIRONMENT[2],
             SANDBOX_IMAGE,
             *command.test_paths,
         )

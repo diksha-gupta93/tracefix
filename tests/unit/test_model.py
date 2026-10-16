@@ -158,6 +158,7 @@ def test_typed_provider_protocol_and_request_round_trip() -> None:
 
     provider: ModelProvider = Provider()
     request = ModelProviderRequest(
+        case_id="case-001",
         operation=ModelOperation.REPAIR_PLANNING,
         model_name="test-model",
         temperature=0.0,
@@ -190,6 +191,7 @@ def test_typed_provider_protocol_and_request_round_trip() -> None:
         (
             ModelProviderRequest,
             {
+                "case_id": "case-001",
                 "operation": ModelOperation.REPAIR_PLANNING,
                 "model_name": "model",
                 "temperature": 0.0,
@@ -240,6 +242,7 @@ def test_new_boundary_models_forbid_extra_fields(
 )
 def test_request_numeric_fields_are_strict(field: str, value: object) -> None:
     values: dict[str, object] = {
+        "case_id": "case-001",
         "operation": ModelOperation.REPAIR_PLANNING,
         "model_name": "model",
         "temperature": 0.0,
@@ -257,6 +260,7 @@ def test_request_numeric_fields_are_strict(field: str, value: object) -> None:
 def test_new_boundary_models_are_frozen() -> None:
     configuration = load_model_configuration(valid_environment())
     request = ModelProviderRequest(
+        case_id="case-001",
         operation=ModelOperation.REPAIR_PLANNING,
         model_name="model",
         temperature=0.0,
@@ -285,6 +289,7 @@ def test_new_boundary_models_are_frozen() -> None:
 def test_boundary_models_strict_json_round_trip() -> None:
     configuration = load_model_configuration(valid_environment())
     request = ModelProviderRequest(
+        case_id="case-001",
         operation=ModelOperation.PATCH_GENERATION,
         model_name="model-ü",
         temperature=0.25,
@@ -317,6 +322,53 @@ def test_boundary_models_strict_json_round_trip() -> None:
     assert restored_diagnostic == diagnostic
     assert restored_diagnostic.stage is ModelDiagnosticStage.PATCH_GENERATION
     assert restored_diagnostic.code is ModelDiagnosticCode.INVALID_PATCH_ENVELOPE
+
+
+@pytest.mark.parametrize(
+    "case_id",
+    [
+        "",
+        " ",
+        "UPPER",
+        "-leading",
+        "contains.dot",
+        "contains/slash",
+        "contains\\backslash",
+        "a" * 129,
+        1,
+        True,
+        None,
+    ],
+)
+def test_provider_request_rejects_invalid_case_identity(case_id: object) -> None:
+    values: dict[str, object] = {
+        "case_id": case_id,
+        "operation": ModelOperation.REPAIR_PLANNING,
+        "model_name": "model",
+        "temperature": 0.0,
+        "max_output_tokens": 1,
+        "prompt_version": "repair-v1.0",
+        "attempt_number": 1,
+        "rendered_prompt": "prompt",
+    }
+
+    with pytest.raises(ValidationError):
+        ModelProviderRequest.model_validate(values)
+
+
+def test_provider_request_requires_case_identity() -> None:
+    with pytest.raises(ValidationError):
+        ModelProviderRequest.model_validate(
+            {
+                "operation": ModelOperation.REPAIR_PLANNING,
+                "model_name": "model",
+                "temperature": 0.0,
+                "max_output_tokens": 1,
+                "prompt_version": "repair-v1.0",
+                "attempt_number": 1,
+                "rendered_prompt": "prompt",
+            }
+        )
 
 
 @pytest.mark.parametrize(

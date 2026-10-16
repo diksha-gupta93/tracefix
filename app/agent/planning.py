@@ -168,11 +168,13 @@ def _generation_prompt(context: ContextPackage, plan: RepairPlan) -> str:
 
 
 def _request(
+    case_id: str,
     operation: ModelOperation,
     configuration: ModelConfiguration,
     prompt: str,
 ) -> ModelProviderRequest:
     return ModelProviderRequest(
+        case_id=case_id,
         operation=operation,
         model_name=configuration.model_name,
         temperature=configuration.temperature,
@@ -280,6 +282,7 @@ def plan_repair(
     validated_configuration = _validated_configuration(configuration)
     validated_context = _validated_context(context, ModelDiagnosticStage.PLANNING)
     request = _request(
+        validated_context.case_id,
         ModelOperation.REPAIR_PLANNING,
         validated_configuration,
         _planning_prompt(validated_context),
@@ -307,6 +310,7 @@ def generate_patch(
             "repair plan is unsuitable for autonomous generation",
         )
     request = _request(
+        validated_context.case_id,
         ModelOperation.PATCH_GENERATION,
         validated_configuration,
         _generation_prompt(validated_context, validated_plan),

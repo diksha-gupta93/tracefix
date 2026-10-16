@@ -287,11 +287,36 @@ def test_planning_and_generation_succeed_through_typed_provider() -> None:
         ModelOperation.PATCH_GENERATION,
     ]
     for request in provider.requests:
+        assert request.case_id == package.case_id
         assert request.model_name == "unit-model"
         assert request.temperature == 0.0
         assert request.max_output_tokens == 2048
         assert request.prompt_version == "repair-v1.0"
         assert request.attempt_number == 1
+
+
+def test_planning_and_generation_propagate_case_identity_without_prompt_parsing() -> None:
+    package = context_package(case_id="case-identity")
+    plan = repair_plan()
+    provider = QueueProvider(response(plan), response(patch_proposal()))
+
+    planned = plan_repair(package, configuration(), provider)
+    generate_patch(package, planned, configuration(), provider)
+
+    assert [request.case_id for request in provider.requests] == [
+        "case-identity",
+        "case-identity",
+    ]
+    assert provider.requests[0].rendered_prompt.startswith(
+        "TraceFix repair planning prompt repair-v1.0."
+    )
+    assert provider.requests[1].rendered_prompt.startswith(
+        "TraceFix patch generation prompt repair-v1.0."
+    )
+    assert all(
+        request.rendered_prompt.count(package.downstream_text()) == 1
+        for request in provider.requests
+    )
 
 
 def test_prompts_are_deterministic_delimited_and_minimal() -> None:

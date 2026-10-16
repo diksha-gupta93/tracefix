@@ -475,13 +475,17 @@ def _clock() -> datetime:
 def default_application_factory() -> RepairApplication:
     from app.agent.model import load_model_configuration
     from app.artifacts import LocalArtifactWriter
+    from app.evaluation.deterministic.fake_model import (
+        FAKE_PROVIDER_NAME,
+        create_fake_model_provider,
+    )
     from benchmarks.loader import load_trusted_case
 
     return RepairApplication(
         ApplicationDependencies(
             case_loader=load_trusted_case,
             configuration_loader=load_model_configuration,
-            provider_registry=ProviderRegistry(),
+            provider_registry=ProviderRegistry({FAKE_PROVIDER_NAME: create_fake_model_provider}),
             workspace_manager=LocalWorkspaceManager(),
             artifact_writer=LocalArtifactWriter(),
             graph_dependencies_factory=DefaultGraphDependenciesFactory(),
