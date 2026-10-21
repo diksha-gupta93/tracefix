@@ -20,7 +20,7 @@ full-visible, and hidden verification to pass.
 
 ## Current Status
 
-The repository has completed the v0.1 foundation through Task 0.1.10a:
+The repository has completed the v0.1 foundation through Task 0.1.10b:
 
 - Python 3.14 packaging, CI, and deterministic quality tooling
 - strict Pydantic v2 schemas for repair state, results, plans, patches, and evaluations
@@ -40,8 +40,9 @@ The repository has completed the v0.1 foundation through Task 0.1.10a:
   context exclusion with immutable protected-path metadata
 - strict frozen configuration for the five model and prompt environment variables, with no
   defaults or credential handling
-- a typed dependency-injected model-provider protocol with no production fake, live adapter, SDK,
-  network call, streaming, tool call, or retry behavior
+- a typed dependency-injected model-provider protocol with one production-composed deterministic
+  fake provider and no live adapter, SDK, external model network call, streaming, tool call, or
+  retry behavior
 - deterministic versioned planning and generation prompts that delimit the exact bounded context
   as untrusted data and request schema-only JSON
 - strict `RepairPlan` and `PatchProposal` parsing, bounded provider output, safe typed diagnostics,
@@ -73,11 +74,12 @@ The repository has completed the v0.1 foundation through Task 0.1.10a:
 - an in-memory, single-attempt LangGraph with eleven named nodes, explicit terminal short circuits,
   no retry edge, and seven fixed terminal outcomes
 - `tracefix repair <case_id>` with preflight case validation, stable exit codes, graph-owned private
-  workspaces, deterministic safe artifacts, and an empty production provider registry
+  workspaces, deterministic safe artifacts, and a production registry that registers and resolves
+  only the `tracefix-fake` provider
 
 [`docs/progress.md`](docs/progress.md) is the source of truth for task completion and recorded
 validation evidence. It currently records no task as in progress. The next planned task in the
-execution plan is Task 0.1.10b: deterministic fake-provider integration.
+execution plan is Task 0.1.11a: live-provider benchmark integration.
 
 ## Why TraceFix
 
