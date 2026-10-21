@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO
@@ -48,6 +49,24 @@ def test_prepares_exact_snapshot_with_stable_fingerprint(tmp_path: Path) -> None
             relative = copied.relative_to(first.prepared_repository)
             assert copied.read_bytes() == (source / relative).read_bytes()
     assert not (first.prepared_repository / "evaluator").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are required for this contract")
+def test_prepared_snapshot_is_readable_by_fixed_non_root_sandbox(tmp_path: Path) -> None:
+    preparation = RepositoryPreparer(_loader).prepare(
+        "incorrect_conditional",
+        "incorrect_conditional-failing-v1",
+        tmp_path,
+    )
+
+    entries = (preparation.prepared_repository, *preparation.prepared_repository.rglob("*"))
+    for entry in entries:
+        mode = stat.S_IMODE(entry.stat().st_mode)
+        if entry.is_dir():
+            assert mode & stat.S_IROTH
+            assert mode & stat.S_IXOTH
+        else:
+            assert mode & stat.S_IROTH
 
 
 @pytest.mark.parametrize("revision", [None, "", "incorrect_conditional-base-v1"])

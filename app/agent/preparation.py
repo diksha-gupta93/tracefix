@@ -284,7 +284,12 @@ class LocalPreparationFilesystem:
                         next_parent = os.open(part, flags, dir_fd=parent)
                         os.close(parent)
                         parent = next_parent
-                    os.mkdir(path.name, dir_fd=parent)
+                    os.mkdir(path.name, mode=0o755, dir_fd=parent)
+                    created = os.open(path.name, flags, dir_fd=parent)
+                    try:
+                        os.fchmod(created, 0o755)
+                    finally:
+                        os.close(created)
                 finally:
                     os.close(parent)
             else:
@@ -407,6 +412,9 @@ class LocalPreparationFilesystem:
                 raise PreparationError(
                     PreparationErrorCode.SOURCE_MUTATED, "source changed while being copied"
                 )
+            if os.name != "nt":
+                output.flush()
+                os.fchmod(output.fileno(), 0o644)
 
     def read_file(self, path: Path, expected: _EntryIdentity) -> bytes:
         with self.open_source(path, expected) as source_file:
