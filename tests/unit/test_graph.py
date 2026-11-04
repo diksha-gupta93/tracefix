@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -17,7 +19,7 @@ from app.agent.graph import (
     invoke_repair_graph,
     new_orchestration_state,
 )
-from app.agent.model import ModelProvider
+from app.agent.model import ModelDiagnosticError, ModelProvider
 from app.agent.policy import PatchPolicy, PatchPolicyResult, validate_patch_policy
 from app.agent.routing import TerminalOutcome
 from app.agent.schemas import (
@@ -31,6 +33,9 @@ from app.agent.schemas import (
     ContextPackage,
     FailureAnalysis,
     ModelConfiguration,
+    ModelDiagnostic,
+    ModelDiagnosticCode,
+    ModelDiagnosticStage,
     ModelProviderRequest,
     ModelProviderResponse,
     PatchProposal,
@@ -59,6 +64,7 @@ from app.agent.verification import (
 from app.evaluation.deterministic.candidate import (
     CandidateEvaluationRequest,
     CandidateEvaluationResult,
+    CandidateModelUsage,
     evaluate_candidate,
 )
 from app.sandbox.results import SandboxCompletion
@@ -597,6 +603,122 @@ def test_normal_graph_executes_every_forward_transition_once(tmp_path: Path) -> 
     assert result.completed_nodes == NODE_NAMES
     assert result.terminal_route is not None
     assert result.terminal_route.outcome is TerminalOutcome.SUCCESS
+
+
+def test_graph_snapshots_live_usage_and_hands_it_to_candidate_evaluation(
+    tmp_path: Path,
+) -> None:
+    usage = CandidateModelUsage(
+        model_latency_seconds=0.75,
+        input_tokens=120,
+        output_tokens=40,
+        estimated_cost_usd=Decimal("0.000042"),
+    )
+
+    class UsageReader:
+        def snapshot_usage(self) -> CandidateModelUsage:
+            return usage
+
+    calls: list[str] = []
+    dependencies = replace(_transition_dependencies(None, calls), model_usage_reader=UsageReader())
+    run_id = "8" * 32
+    initial = new_orchestration_state(
+        run_id=run_id,
+        trusted_case=load_trusted_case("boundary_condition"),
+        workspaces=_workspaces(tmp_path, run_id),
+        started_at=datetime(2026, 1, 1, tzinfo=UTC),
+        model_configuration=_model_configuration(),
+    )
+    result = invoke_repair_graph(build_repair_graph(dependencies), initial)
+
+    assert result.model_usage == usage
+    assert result.evaluation_result is not None
+    assert result.evaluation_result.model_latency_seconds == 0.75
+    assert result.evaluation_result.input_tokens == 120
+    assert result.evaluation_result.output_tokens == 40
+    assert result.evaluation_result.estimated_cost_usd == Decimal("0.000042")
+
+
+def test_state_rejects_usage_before_model_execution(tmp_path: Path) -> None:
+    run_id = "6" * 32
+    initial = new_orchestration_state(
+        run_id=run_id,
+        trusted_case=load_trusted_case("boundary_condition"),
+        workspaces=_workspaces(tmp_path, run_id),
+        started_at=datetime(2026, 1, 1, tzinfo=UTC),
+        model_configuration=_model_configuration(),
+    )
+    payload = initial.model_dump(warnings="none")
+    payload["model_usage"] = CandidateModelUsage(
+        model_latency_seconds=0.1,
+        input_tokens=1,
+        output_tokens=1,
+        estimated_cost_usd=Decimal("0.01"),
+    ).model_dump(warnings="none")
+    with pytest.raises(ValidationError, match="without complete model execution"):
+        OrchestrationState.model_validate(payload, strict=True)
+
+
+def test_state_rejects_evaluation_usage_that_disagrees_with_run(tmp_path: Path) -> None:
+    calls: list[str] = []
+    result = _invoke_transition_graph(tmp_path, None, calls)
+    assert result.evaluation_result is not None
+    payload = result.model_dump(warnings="none")
+    evaluation = dict(payload["evaluation_result"])
+    evaluation["input_tokens"] = 1
+    payload["evaluation_result"] = evaluation
+    with pytest.raises(ValidationError, match="evaluation usage"):
+        OrchestrationState.model_validate(payload, strict=True)
+
+
+def test_early_malformed_model_failure_retains_completed_call_usage(
+    tmp_path: Path,
+) -> None:
+    usage = CandidateModelUsage(
+        model_latency_seconds=0.25,
+        input_tokens=50,
+        output_tokens=3,
+        estimated_cost_usd=Decimal("0.0000093"),
+    )
+
+    class UsageReader:
+        def snapshot_usage(self) -> CandidateModelUsage:
+            return usage
+
+    def malformed_planner(
+        context: ContextPackage,
+        configuration: ModelConfiguration,
+        provider: ModelProvider,
+    ) -> RepairPlan:
+        del context, configuration, provider
+        raise ModelDiagnosticError(
+            ModelDiagnostic(
+                stage=ModelDiagnosticStage.PLANNING,
+                code=ModelDiagnosticCode.MALFORMED_STRUCTURED_OUTPUT,
+                message="model provider returned malformed structured output",
+            )
+        )
+
+    calls: list[str] = []
+    dependencies = replace(
+        _transition_dependencies(None, calls),
+        planner=malformed_planner,
+        model_usage_reader=UsageReader(),
+    )
+    run_id = "7" * 32
+    initial = new_orchestration_state(
+        run_id=run_id,
+        trusted_case=load_trusted_case("boundary_condition"),
+        workspaces=_workspaces(tmp_path, run_id),
+        started_at=datetime(2026, 1, 1, tzinfo=UTC),
+        model_configuration=_model_configuration(),
+    )
+    result = invoke_repair_graph(build_repair_graph(dependencies), initial)
+
+    assert result.terminal_route is not None
+    assert result.terminal_route.outcome is TerminalOutcome.MALFORMED_MODEL_OUTPUT
+    assert result.model_usage == usage
+    assert result.evaluation_result is None
 
 
 @pytest.mark.parametrize("failure_node", NODE_NAMES[:-1])

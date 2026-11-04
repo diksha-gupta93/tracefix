@@ -54,13 +54,47 @@ def test_cli_help_and_argument_surface(capsys: pytest.CaptureFixture[str]) -> No
     with pytest.raises(SystemExit) as help_exit:
         main(["--help"], application_factory=_unknown_application)
     assert help_exit.value.code == 0
-    assert "{repair}" in capsys.readouterr().out
+    assert "{repair,benchmark}" in capsys.readouterr().out
+
+    with pytest.raises(SystemExit) as benchmark_help_exit:
+        main(["benchmark", "--help"], application_factory=_unknown_application)
+    assert benchmark_help_exit.value.code == 0
+    benchmark_help = capsys.readouterr().out
+    assert "--split {development}" in benchmark_help
+    assert "--provider {openai}" in benchmark_help
     with pytest.raises(SystemExit) as missing_exit:
         main([], application_factory=_unknown_application)
     assert missing_exit.value.code == 2
     with pytest.raises(SystemExit) as extra_exit:
         main(["repair", "boundary_condition", "extra"], application_factory=_unknown_application)
     assert extra_exit.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["benchmark"],
+        ["benchmark", "--split", "development"],
+        ["benchmark", "--provider", "openai"],
+        ["benchmark", "--split", "Development", "--provider", "openai"],
+        ["benchmark", "--split", "development", "--provider", "OpenAI"],
+        ["benchmark", "--split", "development", "--provider", "openai", "extra"],
+    ],
+)
+def test_invalid_benchmark_arguments_have_no_application_side_effects(
+    arguments: list[str],
+) -> None:
+    called = False
+
+    def forbidden_factory():
+        nonlocal called
+        called = True
+        raise AssertionError("benchmark application must not be created")
+
+    with pytest.raises(SystemExit) as raised:
+        main(arguments, benchmark_application_factory=forbidden_factory)
+    assert raised.value.code == 2
+    assert not called
 
 
 @pytest.mark.parametrize("case_id", ["../case", "C:\\case", "/case", "UPPER", "a" * 129])
@@ -242,4 +276,4 @@ def test_installed_entry_point_help_smoke() -> None:
         encoding="utf-8",
     )
     assert result.returncode == 0
-    assert "{repair}" in result.stdout
+    assert "{repair,benchmark}" in result.stdout

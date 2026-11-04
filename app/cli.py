@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol, TextIO
 
@@ -23,6 +23,9 @@ if TYPE_CHECKING:
     from app.agent.model import ModelProvider
     from app.agent.schemas import ModelConfiguration
     from app.artifacts import ArtifactWriter
+    from app.evaluation.benchmark import BenchmarkReport
+    from app.evaluation.live_model import LiveBenchmarkConfiguration
+    from app.evaluation.reporting import BenchmarkReportPublication
     from benchmarks.loader import TrustedCase
 
 _CASE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
@@ -42,6 +45,14 @@ class RunInitializationError(Exception):
     """A known-case run could not be initialized safely."""
 
 
+class RepairExecutionError(RuntimeError):
+    """A repair case failed without a trustworthy terminal artifact."""
+
+
+class RepairArtifactPublicationError(RepairExecutionError):
+    """A repair completed but its safe artifact could not be published."""
+
+
 class TrustedCaseLoader(Protocol):
     def __call__(self, case_id: str) -> TrustedCase: ...
 
@@ -52,6 +63,33 @@ class ConfigurationLoader(Protocol):
 
 class ProviderFactory(Protocol):
     def __call__(self, configuration: ModelConfiguration) -> ModelProvider: ...
+
+
+class DevelopmentCaseLoader(Protocol):
+    def __call__(self) -> tuple[TrustedCase, ...]: ...
+
+
+class LiveConfigurationLoader(Protocol):
+    def __call__(self, environment: Mapping[str, str]) -> LiveBenchmarkConfiguration: ...
+
+
+class LiveProviderFactory(Protocol):
+    def __call__(
+        self,
+        configuration: ModelConfiguration,
+        live_configuration: LiveBenchmarkConfiguration,
+        environment: Mapping[str, str],
+    ) -> ModelProvider: ...
+
+
+class BenchmarkReportWriter(Protocol):
+    def write(
+        self, report: BenchmarkReport, invocation_directory: Path
+    ) -> BenchmarkReportPublication: ...
+
+    def discard(
+        self, publication: BenchmarkReportPublication, invocation_directory: Path
+    ) -> None: ...
 
 
 class ProviderRegistry:
@@ -234,7 +272,11 @@ class DefaultGraphDependenciesFactory:
     ) -> GraphDependencies:
         from app.agent.baseline import BaselineExecutor
         from app.agent.context import ContextSelector
-        from app.agent.graph import GraphDependencies, LocalWorkspaceIntegrityBoundary
+        from app.agent.graph import (
+            GraphDependencies,
+            LocalWorkspaceIntegrityBoundary,
+            ModelUsageReader,
+        )
         from app.agent.preparation import LocalPreparationFilesystem, RepositoryPreparer
         from app.agent.static_checks import (
             LocalStaticFilesystem,
@@ -281,6 +323,7 @@ class DefaultGraphDependenciesFactory:
             clock=clock,
             model_configuration=configuration,
             model_provider=provider,
+            model_usage_reader=(provider if isinstance(provider, ModelUsageReader) else None),
         )
 
 
@@ -298,6 +341,12 @@ class ApplicationDependencies:
     environment: Mapping[str, str]
     stdout: TextIO
     stderr: TextIO
+
+
+@dataclass(frozen=True, slots=True)
+class RepairRunExecution:
+    state: OrchestrationState
+    artifact_path: PurePosixPath
 
 
 class RepairApplication:
@@ -329,18 +378,8 @@ class RepairApplication:
             raise RunInitializationError("trusted case validation failed") from None
 
     def repair(self, case_id: str) -> int:
-        from app.agent.graph import (
-            build_repair_graph,
-            invoke_repair_graph,
-            new_orchestration_state,
-            replace_with_infrastructure_failure,
-            terminalize_infrastructure_failure,
-        )
         from app.agent.schemas import ModelConfiguration
-        from app.artifacts import (
-            ArtifactSummary,
-            project_artifact,
-        )
+        from app.artifacts import ArtifactSummary
 
         dependencies = self._dependencies
         try:
@@ -348,17 +387,6 @@ class RepairApplication:
         except CliInputError:
             raise
         except RunInitializationError:
-            self._safe_error("tracefix: run initialization failed\n")
-            return 6
-        try:
-            run_id = dependencies.run_id_factory()
-            started = dependencies.clock()
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except Exception:
-            self._safe_error("tracefix: run initialization failed\n")
-            return 6
-        if type(run_id) is not str or _RUN_ID.fullmatch(run_id) is None:
             self._safe_error("tracefix: run initialization failed\n")
             return 6
         configuration: ModelConfiguration | None = None
@@ -374,6 +402,78 @@ class RepairApplication:
         except Exception:
             configuration = None
             provider = None
+        try:
+            execution = self.execute_trusted_case(case, configuration, provider)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except RunInitializationError:
+            self._safe_error("tracefix: run initialization failed\n")
+            return 6
+        except RepairArtifactPublicationError:
+            self._safe_error("tracefix: artifact publication failed\n")
+            return 6
+        except RepairExecutionError:
+            self._safe_error("tracefix: repair run failed safely\n")
+            return 6
+        try:
+            route = execution.state.terminal_route
+            if route is None:
+                raise ValueError
+            summary = ArtifactSummary(
+                case_id=execution.state.case_id,
+                outcome=route.outcome,
+                summary=(
+                    route.diagnostic.message
+                    if route.diagnostic is not None
+                    else "repair candidate passed all required checks"
+                ),
+                exit_code=route.exit_code,
+                artifact_path=execution.artifact_path,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            self._safe_error("tracefix: artifact publication failed\n")
+            return 6
+        try:
+            dependencies.stdout.write(f"{summary.render()}\n")
+            dependencies.stdout.flush()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            self._safe_error("tracefix: console output failed\n")
+            return 6
+        return route.exit_code
+
+    def execute_trusted_case(
+        self,
+        case: TrustedCase,
+        configuration: ModelConfiguration | None,
+        provider: ModelProvider | None,
+    ) -> RepairRunExecution:
+        from app.agent.graph import (
+            build_repair_graph,
+            invoke_repair_graph,
+            new_orchestration_state,
+            replace_with_infrastructure_failure,
+            terminalize_infrastructure_failure,
+        )
+        from app.artifacts import ArtifactPublication, project_artifact
+        from benchmarks.loader import TrustedCase
+
+        dependencies = self._dependencies
+        try:
+            if type(case) is not TrustedCase:
+                raise ValueError
+            checked_case = TrustedCase.model_validate(case.model_dump(warnings="none"), strict=True)
+            run_id = dependencies.run_id_factory()
+            started = dependencies.clock()
+            if type(run_id) is not str or _RUN_ID.fullmatch(run_id) is None:
+                raise ValueError
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise RunInitializationError("repair run initialization failed") from None
 
         workspaces: RunWorkspaces | None = None
         state: OrchestrationState | None = None
@@ -382,7 +482,7 @@ class RepairApplication:
             workspaces = dependencies.workspace_manager.create(run_id)
             initial = new_orchestration_state(
                 run_id=run_id,
-                trusted_case=case,
+                trusted_case=checked_case,
                 workspaces=workspaces,
                 started_at=started,
                 model_configuration=configuration,
@@ -401,11 +501,7 @@ class RepairApplication:
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception:
-            if state is not None and state.terminal_route is not None:
-                projected = None
-            else:
-                self._safe_error("tracefix: run initialization failed\n")
-                return 6
+            projected = None
         finally:
             if workspaces is not None:
                 try:
@@ -421,46 +517,163 @@ class RepairApplication:
                             projected = None
 
         if state is None or state.terminal_route is None or projected is None:
-            self._safe_error("tracefix: repair run failed safely\n")
-            return 6
+            raise RepairExecutionError("repair run failed safely")
         try:
             invocation_value = dependencies.invocation_directory()
             if not isinstance(invocation_value, Path):
-                raise ValueError("invocation directory has the wrong type")
-            invocation = invocation_value.absolute()
-            publication = dependencies.artifact_writer.write(projected, invocation)
-            from app.artifacts import ArtifactPublication
-
+                raise ValueError
+            publication = dependencies.artifact_writer.write(projected, invocation_value.absolute())
             if type(publication) is not ArtifactPublication:
-                raise ValueError("artifact writer returned the wrong type")
-            publication = ArtifactPublication.model_validate(
+                raise ValueError
+            checked_publication = ArtifactPublication.model_validate(
                 publication.model_dump(warnings="none"), strict=True
             )
-            summary = ArtifactSummary(
-                case_id=state.case_id,
-                outcome=state.terminal_route.outcome,
-                summary=(
-                    state.terminal_route.diagnostic.message
-                    if state.terminal_route.diagnostic is not None
-                    else "repair candidate passed all required checks"
-                ),
-                exit_code=state.terminal_route.exit_code,
-                artifact_path=publication.relative_path,
+            return RepairRunExecution(
+                state=state,
+                artifact_path=checked_publication.relative_path,
             )
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception:
-            self._safe_error("tracefix: artifact publication failed\n")
+            raise RepairArtifactPublicationError("repair artifact publication failed") from None
+
+    def _safe_error(self, message: str) -> None:
+        with suppress(Exception):
+            self._dependencies.stderr.write(message)
+            self._dependencies.stderr.flush()
+
+
+@dataclass(frozen=True, slots=True)
+class BenchmarkApplicationDependencies:
+    repair_application: RepairApplication
+    development_case_loader: DevelopmentCaseLoader
+    configuration_loader: ConfigurationLoader
+    live_configuration_loader: LiveConfigurationLoader
+    live_provider_factory: LiveProviderFactory
+    report_writer: BenchmarkReportWriter
+    clock: Clock
+    run_id_factory: Callable[[], str]
+    invocation_directory: Callable[[], Path]
+    environment: Mapping[str, str]
+    stdout: TextIO
+    stderr: TextIO
+
+
+class BenchmarkApplication:
+    def __init__(self, dependencies: BenchmarkApplicationDependencies) -> None:
+        self._dependencies = dependencies
+
+    def benchmark(self, split: str, provider_argument: str) -> int:
+        from app.agent.schemas import ModelConfiguration
+        from app.evaluation.benchmark import (
+            BenchmarkCaseExecution,
+            BenchmarkExecutionStatus,
+            build_benchmark_report,
+            run_benchmark_cases,
+        )
+        from app.evaluation.live_model import (
+            OPENAI_PROVIDER_NAME,
+            apply_live_model_configuration,
+        )
+        from app.evaluation.reporting import (
+            BenchmarkReportPublication,
+            BenchmarkSummary,
+        )
+
+        dependencies = self._dependencies
+        if split != "development" or provider_argument != OPENAI_PROVIDER_NAME:
+            raise CliInputError("benchmark arguments are invalid")
+        try:
+            benchmark_run_id = dependencies.run_id_factory()
+            started_at = dependencies.clock()
+            if type(benchmark_run_id) is not str or _RUN_ID.fullmatch(benchmark_run_id) is None:
+                raise ValueError
+            base_configuration = dependencies.configuration_loader(dependencies.environment)
+            base_configuration = ModelConfiguration.model_validate(
+                base_configuration.model_dump(warnings="none"), strict=True
+            )
+            configuration = apply_live_model_configuration(
+                base_configuration, provider_argument, dependencies.environment
+            )
+            live_configuration = dependencies.live_configuration_loader(dependencies.environment)
+            first_provider = dependencies.live_provider_factory(
+                configuration, live_configuration, dependencies.environment
+            )
+            cases = dependencies.development_case_loader()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            self._safe_error("tracefix: benchmark preflight failed\n")
+            return 6
+
+        providers: list[ModelProvider] = [first_provider]
+
+        def execute_case(case: TrustedCase) -> BenchmarkCaseExecution:
+            model_provider = (
+                providers.pop()
+                if providers
+                else dependencies.live_provider_factory(
+                    configuration, live_configuration, dependencies.environment
+                )
+            )
+            execution = dependencies.repair_application.execute_trusted_case(
+                case, configuration, model_provider
+            )
+            route = execution.state.terminal_route
+            if route is None:
+                raise RepairExecutionError("repair run did not terminate")
+            return BenchmarkCaseExecution(
+                case_id=execution.state.case_id,
+                terminal_outcome=route.outcome,
+                model_usage=execution.state.model_usage,
+                artifact_path=execution.artifact_path,
+            )
+
+        try:
+            case_results = run_benchmark_cases(cases, execute_case)
+            completed_at = dependencies.clock()
+            report = build_benchmark_report(
+                benchmark_run_id=benchmark_run_id,
+                model=configuration.model_name,
+                prompt_version=configuration.prompt_version,
+                started_at=started_at,
+                completed_at=completed_at,
+                live_configuration=live_configuration,
+                cases=case_results,
+            )
+            invocation_value = dependencies.invocation_directory()
+            if not isinstance(invocation_value, Path):
+                raise ValueError
+            publication = dependencies.report_writer.write(report, invocation_value.absolute())
+            if type(publication) is not BenchmarkReportPublication:
+                raise ValueError
+            checked_publication = BenchmarkReportPublication.model_validate(
+                publication.model_dump(warnings="none"), strict=True
+            )
+            exit_code = 0 if report.execution_status is BenchmarkExecutionStatus.COMPLETED else 6
+            summary = BenchmarkSummary(
+                report=report,
+                exit_code=exit_code,
+                publication=checked_publication,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            self._safe_error("tracefix: benchmark execution failed safely\n")
             return 6
         try:
             dependencies.stdout.write(f"{summary.render()}\n")
             dependencies.stdout.flush()
         except (KeyboardInterrupt, SystemExit):
+            with suppress(Exception):
+                dependencies.report_writer.discard(checked_publication, invocation_value.absolute())
             raise
         except Exception:
-            self._safe_error("tracefix: console output failed\n")
+            with suppress(Exception):
+                dependencies.report_writer.discard(checked_publication, invocation_value.absolute())
+            self._safe_error("tracefix: benchmark console output failed\n")
             return 6
-        return state.terminal_route.exit_code
+        return exit_code
 
     def _safe_error(self, message: str) -> None:
         with suppress(Exception):
@@ -499,7 +712,35 @@ def default_application_factory() -> RepairApplication:
     )
 
 
+def default_benchmark_application_factory() -> BenchmarkApplication:
+    from app.agent.model import load_model_configuration
+    from app.evaluation.live_model import (
+        create_openai_model_provider,
+        load_live_benchmark_configuration,
+    )
+    from app.evaluation.reporting import LocalBenchmarkReportWriter
+    from benchmarks.loader import load_development_cases
+
+    return BenchmarkApplication(
+        BenchmarkApplicationDependencies(
+            repair_application=default_application_factory(),
+            development_case_loader=load_development_cases,
+            configuration_loader=load_model_configuration,
+            live_configuration_loader=load_live_benchmark_configuration,
+            live_provider_factory=create_openai_model_provider,
+            report_writer=LocalBenchmarkReportWriter(),
+            clock=_clock,
+            run_id_factory=lambda: uuid.uuid4().hex,
+            invocation_directory=Path.cwd,
+            environment=os.environ,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
+    )
+
+
 ApplicationFactory = Callable[[], RepairApplication]
+BenchmarkApplicationFactory = Callable[[], BenchmarkApplication]
 
 
 def _enable_editable_project_imports() -> None:
@@ -515,20 +756,31 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     repair = commands.add_parser("repair")
     repair.add_argument("case_id")
+    benchmark = commands.add_parser("benchmark")
+    benchmark.add_argument("--split", required=True, choices=("development",))
+    benchmark.add_argument("--provider", required=True, choices=("openai",))
     return parser
 
 
 def main(
     argv: Sequence[str] | None = None,
     application_factory: ApplicationFactory = default_application_factory,
+    benchmark_application_factory: BenchmarkApplicationFactory = (
+        default_benchmark_application_factory
+    ),
 ) -> int:
     arguments = _parser().parse_args(None if argv is None else list(argv))
     try:
         _enable_editable_project_imports()
-        application = application_factory()
-        if arguments.command != "repair" or type(arguments.case_id) is not str:
-            raise CliInputError("command is invalid")
-        return application.repair(arguments.case_id)
+        if arguments.command == "repair" and type(arguments.case_id) is str:
+            return application_factory().repair(arguments.case_id)
+        if (
+            arguments.command == "benchmark"
+            and type(arguments.split) is str
+            and type(arguments.provider) is str
+        ):
+            return benchmark_application_factory().benchmark(arguments.split, arguments.provider)
+        raise CliInputError("command is invalid")
     except CliInputError:
         with suppress(Exception):
             sys.stderr.write("tracefix: error: invalid or unknown case_id\n")

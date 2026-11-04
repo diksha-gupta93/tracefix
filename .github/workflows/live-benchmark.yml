@@ -1,0 +1,101 @@
+name: Live benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      split:
+        description: Benchmark split
+        required: true
+        type: choice
+        options:
+          - development
+      provider:
+        description: Live provider
+        required: true
+        type: choice
+        options:
+          - openai
+      model:
+        description: Exact reviewed OpenAI model name
+        required: true
+        type: string
+      request_timeout_seconds:
+        description: Request timeout in seconds (1-300)
+        required: true
+        type: string
+      input_price_usd_per_million_tokens:
+        description: Reviewed input price in USD per million tokens
+        required: true
+        type: string
+      output_price_usd_per_million_tokens:
+        description: Reviewed output price in USD per million tokens
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tracefix-live-benchmark
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      MODEL_PROVIDER: ${{ inputs.provider }}
+      MODEL_NAME: ${{ inputs.model }}
+      MODEL_TEMPERATURE: "0"
+      MODEL_MAX_TOKENS: "4096"
+      PROMPT_VERSION: repair-v1.0
+      MODEL_REQUEST_TIMEOUT_SECONDS: ${{ inputs.request_timeout_seconds }}
+      MODEL_INPUT_PRICE_USD_PER_MILLION_TOKENS: ${{ inputs.input_price_usd_per_million_tokens }}
+      MODEL_OUTPUT_PRICE_USD_PER_MILLION_TOKENS: ${{ inputs.output_price_usd_per_million_tokens }}
+    steps:
+      - name: Check out repository
+        # actions/checkout v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Set up Python
+        # actions/setup-python v5.6.0
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.14"
+      - name: Install development and live dependencies
+        run: python -m pip install --editable ".[dev,live]"
+      - name: Check dependency integrity
+        run: python -m pip check
+      - name: Build sandbox image
+        run: docker build --tag tracefix-sandbox:0.1.3a --file docker/sandbox/Dockerfile .
+      - name: Build static-check image
+        run: docker build --tag tracefix-static-checks:0.1.8 --file docker/static-checks/Dockerfile .
+      - name: Run deterministic validation
+        run: python scripts/check.py
+      - name: Run paid live benchmark
+        id: benchmark
+        shell: bash
+        env:
+          BENCHMARK_SPLIT: ${{ inputs.split }}
+          BENCHMARK_PROVIDER: ${{ inputs.provider }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set +e
+          tracefix benchmark --split "${BENCHMARK_SPLIT}" --provider "${BENCHMARK_PROVIDER}"
+          benchmark_status=$?
+          echo "status=${benchmark_status}" >> "${GITHUB_OUTPUT}"
+          exit 0
+      - name: Upload safe benchmark evidence
+        if: ${{ always() }}
+        # actions/upload-artifact v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tracefix-live-benchmark-${{ github.run_id }}
+          path: |
+            .tracefix/benchmarks/**/report.json
+            .tracefix/benchmarks/**/report.md
+            .tracefix/artifacts/*.json
+          if-no-files-found: error
+      - name: Preserve benchmark status
+        if: ${{ always() }}
+        shell: bash
+        run: exit "${{ steps.benchmark.outputs.status || '6' }}"

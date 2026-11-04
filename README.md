@@ -78,8 +78,8 @@ The repository has completed the v0.1 foundation through Task 0.1.10b:
   only the `tracefix-fake` provider
 
 [`docs/progress.md`](docs/progress.md) is the source of truth for task completion and recorded
-validation evidence. It currently records no task as in progress. The next planned task in the
-execution plan is Task 0.1.11a: live-provider benchmark integration.
+validation evidence. Task 0.1.11a adds the explicitly invoked OpenAI live-model benchmark while
+ordinary CI remains deterministic and credential-free.
 
 ## Why TraceFix
 
@@ -118,8 +118,8 @@ The current implementation stops after one routed local attempt. Model access re
 injected protocol, with one production-composed deterministic local fake provider and no live
 provider. Policy approval and static validation are necessary but not sufficient: a candidate is
 successful only when targeted, full-visible, and hidden verification all pass. The graph has no
-checkpointer, persistence, retry, or resume behavior. Task 0.1.11a adds the live-provider benchmark
-boundary. v0.2 adds persistence, queue-backed workers, API ingress, and checkpoint recovery; v1.0
+checkpointer, persistence, retry, or resume behavior. The live-provider benchmark reuses this same
+single-attempt graph. v0.2 adds persistence, queue-backed workers, API ingress, and checkpoint recovery; v1.0
 adds GitHub integration, human approval, and production observability. External systems are
 designed to sit behind typed adapters, and long-running work will run in workers rather than HTTP
 handlers once those layers exist.
@@ -170,8 +170,9 @@ TraceFix can currently:
 Current benchmark revisions are symbolic snapshot identities, not Git commit SHAs. Successful
 prepared workspaces are caller-owned and must be cleaned up after downstream work completes.
 
-TraceFix does not yet provide a live model adapter, API, persistent jobs, queue, GitHub integration,
-benchmark aggregation, retries, or live-model repair success rates.
+TraceFix now provides one explicit OpenAI live-model adapter and development benchmark command. It
+does not provide an API, persistent jobs, queue, GitHub repair integration, retries, provider/model
+comparisons, or production observability.
 
 ## Quick Start
 
@@ -216,8 +217,8 @@ PROMPT_VERSION=repair-v1.0
 The fake provider accepts no alternate profile. It uses explicit project-owned responses keyed by
 case ID, prompt version, and attempt number; it does not parse prompts, read benchmark/evaluator
 files at runtime, require model credentials, or make provider network calls. An unknown provider or
-unsupported fake profile follows the existing safe `infrastructure_failure` route. Live provider
-and benchmark support remains deferred to Task 0.1.11a.
+unsupported fake profile follows the existing safe `infrastructure_failure` route. This repair
+command remains independent from the explicitly configured live benchmark described below.
 
 For identical valid requests, fake response bytes are stable. Across complete runs, the terminal
 route, exit code, changed-file and line-count evidence, stage outcomes, and provider/model/prompt
@@ -252,6 +253,49 @@ the result to `infrastructure_failure`.
 | 7 | `malformed_model_output` |
 
 `KeyboardInterrupt` retains the conventional process exit code `130` after best-effort cleanup.
+
+## Live-Model Benchmark
+
+Live-model benchmarking is separate from deterministic CI and must be invoked explicitly. Install
+the optional live dependency and configure the single approved v0.1 profile:
+
+```text
+python -m pip install --editable ".[dev,live]"
+MODEL_PROVIDER=openai
+MODEL_NAME=<reviewed exact model name>
+MODEL_TEMPERATURE=0
+MODEL_MAX_TOKENS=4096
+PROMPT_VERSION=repair-v1.0
+MODEL_REQUEST_TIMEOUT_SECONDS=120
+MODEL_INPUT_PRICE_USD_PER_MILLION_TOKENS=<reviewed current rate>
+MODEL_OUTPUT_PRICE_USD_PER_MILLION_TOKENS=<reviewed current rate>
+OPENAI_API_KEY=<credential>
+tracefix benchmark --split development --provider openai
+```
+
+The command accepts exactly the `development` split and `openai` provider, then runs all five cases
+sequentially through the same one-attempt graph, policy, static checks, hardened sandbox,
+verification, evaluation, artifact publication, and cleanup used by `tracefix repair`. The
+credential is read only by the provider factory and is never added to model configuration, graph
+state, containers, artifacts, reports, diagnostics, or console output.
+
+Each invocation publishes canonical JSON and equivalent Markdown beneath
+`.tracefix/benchmarks/<benchmark_run_id>/report.json` and `report.md`, with ordered case outcomes,
+latency, provider-reported tokens, exact operator-rate-based estimated USD cost, counts, success
+rate, and aggregates. Estimated cost is not a provider invoice. Valid `candidate_failure`,
+`policy_violation`, `static_check_failure`, and `malformed_model_output` results are benchmark
+evidence, so a run containing only repair successes/failures exits `0`. Provider, platform,
+baseline, cleanup, artifact, or report-publication failure stops later paid work, marks remaining
+cases `not_run` when a partial report can be published, and exits `6`. Interruption exits `130`.
+
+The manual **Live benchmark** GitHub Actions workflow installs `.[dev,live]`, runs deterministic
+validation, builds both fixed images, performs the explicitly authorized paid run, and uploads only
+the safe report pair and metadata-only per-case artifacts. It is triggered only by
+`workflow_dispatch`; it is not a required push or pull-request check.
+
+Current limitations are one explicitly configured OpenAI model, five development cases, one attempt,
+no retries, no schedules, no provider/model comparisons, no confidence intervals, no persistence,
+and no production observability.
 
 ## Validation
 
@@ -342,9 +386,11 @@ This is deterministic platform and integration testing: it answers whether prepa
 classification, model-boundary handling, patch enforcement, isolation, verification, evaluation,
 artifact publication, and cleanup behave correctly. It does not measure or claim live-model repair
 capability. Candidate evaluation reparses the inert diff for deterministic files and added/removed
-counts, sums only executed verification-stage duration, and preserves optional trusted upstream
-model measurements without pricing or provider access. Future live-model evaluation will separately
-measure repair capability. No live-model repair success rate is reported until that boundary exists.
+counts, sums only executed verification-stage duration, and receives trusted aggregate live usage
+when the live benchmark reaches evaluation. The versioned benchmark report remains the canonical
+complete usage and exact operator-rate-based cost record, including earlier valid model-repair
+failures. No model-performance result is claimed here; measured results exist only in reports from
+human-authorized runs.
 
 ## Repository Structure
 
@@ -359,8 +405,7 @@ measure repair capability. No live-model repair success rate is reported until t
 
 ## Roadmap
 
-- **Remaining v0.1:** add the Task 0.1.11a live-provider benchmark boundary while keeping it
-  separate from deterministic fake-provider platform validation.
+- **Remaining v0.1:** complete the Task 0.1.11b release documentation and checklist.
 - **v0.2:** add PostgreSQL-backed state, queue workers, FastAPI ingress, LangGraph checkpointing,
   recovery, bounded retries, and expanded evaluation.
 - **v1.0:** add GitHub App workflows, human approval, observability, resilience hardening, and

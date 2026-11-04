@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast, runtime_checkable
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -209,6 +209,15 @@ class OrchestrationState(BaseModel):
         )
         if any(value is not None and node not in before_route for value, node in evidence_nodes):
             raise ValueError("graph evidence exists for a node that did not execute")
+        if self.model_usage is not None:
+            measurements = (
+                self.model_usage.model_latency_seconds,
+                self.model_usage.input_tokens,
+                self.model_usage.output_tokens,
+                self.model_usage.estimated_cost_usd,
+            )
+            if "plan_repair" not in before_route or any(item is None for item in measurements):
+                raise ValueError("model usage exists without complete model execution evidence")
         if any(
             value is None
             and node in before_route
@@ -257,6 +266,24 @@ class OrchestrationState(BaseModel):
                 raise ValueError("evaluation is missing proposal or verification evidence")
             if self.evaluation_result.case_id != self.case_id:
                 raise ValueError("evaluation does not match run")
+            evaluation_usage = (
+                self.evaluation_result.model_latency_seconds,
+                self.evaluation_result.input_tokens,
+                self.evaluation_result.output_tokens,
+                self.evaluation_result.estimated_cost_usd,
+            )
+            state_usage = (
+                (None, None, None, None)
+                if self.model_usage is None
+                else (
+                    self.model_usage.model_latency_seconds,
+                    self.model_usage.input_tokens,
+                    self.model_usage.output_tokens,
+                    self.model_usage.estimated_cost_usd,
+                )
+            )
+            if evaluation_usage != state_usage:
+                raise ValueError("evaluation usage does not match run")
         if self.failure_override in {
             TerminalOutcome.SUCCESS,
             TerminalOutcome.POLICY_VIOLATION,
@@ -344,6 +371,11 @@ class WorkspaceIntegrityBoundary(Protocol):
     ) -> None: ...
 
 
+@runtime_checkable
+class ModelUsageReader(Protocol):
+    def snapshot_usage(self) -> CandidateModelUsage: ...
+
+
 def _ordinary_owned_directory(path: Path, parent: Path, expected_name: str | None = None) -> None:
     try:
         metadata = path.lstat()
@@ -423,6 +455,7 @@ class GraphDependencies:
     clock: Clock
     model_configuration: ModelConfiguration | None = None
     model_provider: ModelProvider | None = None
+    model_usage_reader: ModelUsageReader | None = None
     classifier: Classifier = classify_failure
     planner: Planner = plan_repair
     patch_generator: PatchGenerator = generate_patch
@@ -498,17 +531,53 @@ def _attempt_failure(
         raise
     except Exception:
         outcome = TerminalOutcome.INFRASTRUCTURE_FAILURE
+    updates: dict[str, object] = {
+        "attempt_number": 1,
+        "legacy_state": legacy,
+        "failure_override": outcome,
+    }
+    try:
+        usage = _snapshot_usage(dependencies)
+        if usage is not None:
+            updates["model_usage"] = usage
+    except Exception:
+        updates["failure_override"] = TerminalOutcome.INFRASTRUCTURE_FAILURE
     return {
         "state": _finish(
             state,
             "plan_repair",
-            {
-                "attempt_number": 1,
-                "legacy_state": legacy,
-                "failure_override": outcome,
-            },
+            updates,
         )
     }
+
+
+def _snapshot_usage(dependencies: GraphDependencies) -> CandidateModelUsage | None:
+    reader = dependencies.model_usage_reader
+    if reader is None:
+        return None
+    candidate = reader.snapshot_usage()
+    if type(candidate) is not CandidateModelUsage:
+        raise ValueError("model usage reader returned the wrong type")
+    return CandidateModelUsage.model_validate(candidate.model_dump(warnings="none"), strict=True)
+
+
+def _usage_updates(dependencies: GraphDependencies) -> dict[str, object]:
+    usage = _snapshot_usage(dependencies)
+    return {} if usage is None else {"model_usage": usage}
+
+
+def _failure_with_usage(
+    state: OrchestrationState,
+    node: NodeName,
+    dependencies: GraphDependencies,
+    outcome: TerminalOutcome,
+) -> dict[str, object]:
+    updates: dict[str, object] = {"failure_override": outcome}
+    try:
+        updates.update(_usage_updates(dependencies))
+    except Exception:
+        updates["failure_override"] = TerminalOutcome.INFRASTRUCTURE_FAILURE
+    return {"state": _finish(state, node, updates)}
 
 
 def _utc(value: datetime) -> datetime:
@@ -524,7 +593,6 @@ def new_orchestration_state(
     workspaces: RunWorkspaces,
     started_at: datetime,
     model_configuration: ModelConfiguration | None = None,
-    model_usage: CandidateModelUsage | None = None,
 ) -> OrchestrationState:
     case = TrustedCase.model_validate(trusted_case.model_dump(warnings="none"), strict=True)
     started = _utc(started_at)
@@ -543,7 +611,6 @@ def new_orchestration_state(
         legacy_state=legacy,
         workspaces=workspaces,
         model_configuration=model_configuration,
-        model_usage=model_usage,
     )
 
 
@@ -671,15 +738,17 @@ class _GraphNodes:
             plan = RepairPlan.model_validate(plan.model_dump(warnings="none"), strict=True)
             legacy = record_repair_plan(state.legacy_state, state.context, plan, configuration)
             legacy.updated_at = _utc(self._dependencies.clock())
+            updates: dict[str, object] = {
+                "repair_plan": plan,
+                "legacy_state": legacy,
+                "attempt_number": 1,
+            }
+            updates.update(_usage_updates(self._dependencies))
             return {
                 "state": _finish(
                     state,
                     "plan_repair",
-                    {
-                        "repair_plan": plan,
-                        "legacy_state": legacy,
-                        "attempt_number": 1,
-                    },
+                    updates,
                 )
             }
         except (KeyboardInterrupt, SystemExit):
@@ -719,23 +788,35 @@ class _GraphNodes:
                 configuration,
             )
             legacy.updated_at = _utc(self._dependencies.clock())
+            updates: dict[str, object] = {
+                "proposal": proposal,
+                "proposal_digest": _proposal_digest(proposal),
+                "legacy_state": legacy,
+            }
+            updates.update(_usage_updates(self._dependencies))
             return {
                 "state": _finish(
                     state,
                     "generate_patch",
-                    {
-                        "proposal": proposal,
-                        "proposal_digest": _proposal_digest(proposal),
-                        "legacy_state": legacy,
-                    },
+                    updates,
                 )
             }
         except (KeyboardInterrupt, SystemExit):
             raise
         except ModelDiagnosticError as error:
-            return _failure(state, "generate_patch", _model_failure(error))
+            return _failure_with_usage(
+                state,
+                "generate_patch",
+                self._dependencies,
+                _model_failure(error),
+            )
         except Exception:
-            return _failure(state, "generate_patch", TerminalOutcome.INFRASTRUCTURE_FAILURE)
+            return _failure_with_usage(
+                state,
+                "generate_patch",
+                self._dependencies,
+                TerminalOutcome.INFRASTRUCTURE_FAILURE,
+            )
 
     def validate_patch_policy(self, transport: GraphTransport) -> dict[str, object]:
         state = _transport(transport)

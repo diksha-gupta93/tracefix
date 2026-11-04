@@ -23,6 +23,7 @@ NonNegativeFiniteFloat = Annotated[
     float,
     Field(strict=True, ge=0.0, allow_inf_nan=False),
 ]
+StrictTokenCount = Annotated[int, Field(strict=True, ge=0, le=2**63 - 1)]
 
 
 def _require_float(value: object) -> object:
@@ -484,10 +485,19 @@ class ModelProviderRequest(BaseModel):
     rendered_prompt: NonBlankString
 
 
+class ModelCallUsage(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    latency_seconds: NonNegativeFiniteFloat
+    input_tokens: StrictTokenCount
+    output_tokens: StrictTokenCount
+
+
 class ModelProviderResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     raw_json: str
+    usage: ModelCallUsage | None = None
 
 
 class ModelDiagnostic(BaseModel):
