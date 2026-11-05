@@ -200,11 +200,19 @@ def _private_directory(parent: Path, name: str) -> Path:
     return child
 
 
-def _write_file(path: Path, payload: bytes) -> tuple[int, int]:
+@dataclass(frozen=True, slots=True)
+class _FileIdentity:
+    device: int
+    inode: int
+    descriptor: int | None = None
+
+
+def _write_file(path: Path, payload: bytes) -> _FileIdentity:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_BINARY"):
         flags |= os.O_BINARY
     descriptor = os.open(path, flags, 0o600)
+    keep_open = False
     try:
         written = 0
         while written < len(payload):
@@ -214,29 +222,46 @@ def _write_file(path: Path, payload: bytes) -> tuple[int, int]:
             written += count
         os.fsync(descriptor)
         metadata = os.fstat(descriptor)
-        return metadata.st_dev, metadata.st_ino
+        keep_open = os.name != "nt"
+        return _FileIdentity(
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            descriptor=descriptor if keep_open else None,
+        )
     except BaseException:
         metadata = os.fstat(descriptor)
-        identity = (metadata.st_dev, metadata.st_ino)
+        identity = _FileIdentity(
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            descriptor=descriptor,
+        )
         with suppress(OSError, RuntimeError):
             _regular_file_identity(path, identity)
             path.unlink()
         raise
     finally:
-        os.close(descriptor)
+        if not keep_open:
+            os.close(descriptor)
 
 
-def _regular_file_identity(path: Path, expected: tuple[int, int] | None = None) -> tuple[int, int]:
+def _regular_file_identity(path: Path, expected: _FileIdentity | None = None) -> _FileIdentity:
     metadata = path.lstat()
     attributes = getattr(metadata, "st_file_attributes", 0)
-    identity = (metadata.st_dev, metadata.st_ino)
+    identity = _FileIdentity(device=metadata.st_dev, inode=metadata.st_ino)
     if (
         not stat.S_ISREG(metadata.st_mode)
         or path.is_symlink()
         or attributes & _WINDOWS_REPARSE_POINT
-        or (expected is not None and identity != expected)
+        or (
+            expected is not None
+            and (identity.device, identity.inode) != (expected.device, expected.inode)
+        )
     ):
         raise OSError(errno.EIO, "benchmark report identity changed")
+    if expected is not None and expected.descriptor is not None:
+        opened = os.fstat(expected.descriptor)
+        if (opened.st_dev, opened.st_ino) != (identity.device, identity.inode):
+            raise OSError(errno.EIO, "benchmark report identity changed")
     return identity
 
 
@@ -251,7 +276,7 @@ def _sync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _publish(temporary: Path, destination: Path, identity: tuple[int, int]) -> tuple[int, int]:
+def _publish(temporary: Path, destination: Path, identity: _FileIdentity) -> _FileIdentity:
     _regular_file_identity(temporary, identity)
     if destination.exists() or destination.is_symlink():
         raise FileExistsError
@@ -265,12 +290,18 @@ def _publish(temporary: Path, destination: Path, identity: tuple[int, int]) -> t
     return _regular_file_identity(destination, identity)
 
 
+def _close_descriptor(identity: _FileIdentity) -> None:
+    if identity.descriptor is not None:
+        with suppress(OSError):
+            os.close(identity.descriptor)
+
+
 @dataclass(frozen=True, slots=True)
 class _OwnedReportPair:
     publication: BenchmarkReportPublication
     output: Path
     output_identity: tuple[int, int, int, int]
-    files: tuple[tuple[Path, tuple[int, int]], ...]
+    files: tuple[tuple[Path, _FileIdentity], ...]
 
 
 class LocalBenchmarkReportWriter:
@@ -309,7 +340,7 @@ class LocalBenchmarkReportWriter:
         markdown_temp = output / f".report.md.{identifier}.tmp"
         json_path = output / "report.json"
         markdown_path = output / "report.md"
-        owned: dict[Path, tuple[int, int]] = {}
+        owned: dict[Path, _FileIdentity] = {}
         try:
             owned[json_temp] = _write_file(json_temp, benchmark_json_bytes(checked))
             owned[markdown_temp] = _write_file(markdown_temp, benchmark_markdown_bytes(checked))
@@ -317,10 +348,12 @@ class LocalBenchmarkReportWriter:
                 raise OSError(errno.EIO, "benchmark output identity changed")
             json_identity = owned[json_temp]
             published_json_identity = _publish(json_temp, json_path, json_identity)
+            _close_descriptor(json_identity)
             del owned[json_temp]
             owned[json_path] = published_json_identity
             markdown_identity = owned[markdown_temp]
             published_markdown_identity = _publish(markdown_temp, markdown_path, markdown_identity)
+            _close_descriptor(markdown_identity)
             del owned[markdown_temp]
             owned[markdown_path] = published_markdown_identity
             _sync_directory(output)
@@ -375,7 +408,7 @@ class LocalBenchmarkReportWriter:
     def _cleanup(
         output: Path,
         identity: tuple[int, int, int, int],
-        candidates: dict[Path, tuple[int, int]],
+        candidates: dict[Path, _FileIdentity],
     ) -> bool:
         try:
             if _ordinary_directory(output) != identity:
@@ -387,9 +420,14 @@ class LocalBenchmarkReportWriter:
                 _regular_file_identity(path, candidates[path])
             for path in existing:
                 path.unlink()
+            for candidate in candidates.values():
+                _close_descriptor(candidate)
             _sync_directory(output)
             output.rmdir()
             _sync_directory(output.parent)
             return True
         except (OSError, RuntimeError, BenchmarkReportWriteError):
             return False
+        finally:
+            for candidate in candidates.values():
+                _close_descriptor(candidate)
