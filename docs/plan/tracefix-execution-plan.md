@@ -700,6 +700,22 @@ Requirements:
 - Do not include live evaluation in required ordinary CI.
 - Add a manual `workflow_dispatch` workflow.
 
+## Task 0.1.11c — Groq Live-Provider Swap
+
+Spec: `docs/specs/0.1-011c-groq-provider-swap.md`
+
+Requirements:
+- Preserve the committed Task 0.1.11a benchmark infrastructure, deterministic remediation,
+  reporting, failure handling, usage/cost accounting, security controls, and tests.
+- Replace only the live provider-specific OpenAI seam with the official Groq Python SDK and Chat
+  Completions API.
+- Support exactly `groq` with initial model `openai/gpt-oss-120b`, credential `GROQ_API_KEY`, low
+  reasoning effort, 4096 maximum completion tokens, strict operation-specific JSON Schema,
+  disabled tools/streaming, and disabled automatic retries.
+- Keep pricing operator-supplied and make no real Groq request during deterministic implementation.
+- Complete deterministic review before one separately human-authorized Groq run over the existing
+  five development cases.
+
 ## Task 0.1.11b — README, Quick Start, and v0.1 Release Gate
 
 Spec: `docs/specs/0.1-011b-docs-and-release-gate.md`
@@ -1204,10 +1220,10 @@ Record a video or terminal capture. Update CV-positioning claims using only meas
 
 # 7. Revised Task Count
 
-- v0.1: 16 tasks.
+- v0.1: 17 tasks.
 - v0.2: 12 tasks.
 - v1.0: 15 tasks.
-- Total: 43 bounded tasks.
+- Total: 44 bounded tasks.
 
 The increase is intentional. Large security, recovery, and reliability tasks were split so they are easier to implement, test, and review.
 
