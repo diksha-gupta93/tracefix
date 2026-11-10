@@ -25,7 +25,7 @@ from benchmarks.loader import TrustedCase
 
 BENCHMARK_SCHEMA_VERSION: Literal["tracefix-live-benchmark-v1"] = "tracefix-live-benchmark-v1"
 DEVELOPMENT_SPLIT: Literal["development"] = "development"
-OPENAI_REPORT_PROVIDER: Literal["openai"] = "openai"
+GROQ_REPORT_PROVIDER: Literal["groq"] = "groq"
 DEVELOPMENT_CASE_IDS = (
     "boundary_condition",
     "exception_handling",
@@ -166,7 +166,7 @@ class BenchmarkReport(BaseModel):
     schema_version: Literal["tracefix-live-benchmark-v1"] = BENCHMARK_SCHEMA_VERSION
     benchmark_run_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     split: Literal["development"] = DEVELOPMENT_SPLIT
-    provider: Literal["openai"] = OPENAI_REPORT_PROVIDER
+    provider: Literal["groq"] = GROQ_REPORT_PROVIDER
     model: str = Field(min_length=1)
     prompt_version: Literal["repair-v1.0"] = "repair-v1.0"
     max_attempts: Literal[1] = 1

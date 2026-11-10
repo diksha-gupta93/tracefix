@@ -78,7 +78,7 @@ The repository has completed the v0.1 foundation through Task 0.1.10b:
   only the `tracefix-fake` provider
 
 [`docs/progress.md`](docs/progress.md) is the source of truth for task completion and recorded
-validation evidence. Task 0.1.11a adds the explicitly invoked OpenAI live-model benchmark while
+validation evidence. Task 0.1.11c provides the explicitly invoked Groq live-model benchmark while
 ordinary CI remains deterministic and credential-free.
 
 ## Why TraceFix
@@ -170,7 +170,7 @@ TraceFix can currently:
 Current benchmark revisions are symbolic snapshot identities, not Git commit SHAs. Successful
 prepared workspaces are caller-owned and must be cleaned up after downstream work completes.
 
-TraceFix now provides one explicit OpenAI live-model adapter and development benchmark command. It
+TraceFix now provides one explicit Groq live-model adapter and development benchmark command. It
 does not provide an API, persistent jobs, queue, GitHub repair integration, retries, provider/model
 comparisons, or production observability.
 
@@ -261,19 +261,20 @@ the optional live dependency and configure the single approved v0.1 profile:
 
 ```text
 python -m pip install --editable ".[dev,live]"
-MODEL_PROVIDER=openai
-MODEL_NAME=<reviewed exact model name>
+MODEL_PROVIDER=groq
+MODEL_NAME=openai/gpt-oss-120b
 MODEL_TEMPERATURE=0
+MODEL_REASONING_EFFORT=low
 MODEL_MAX_TOKENS=4096
 PROMPT_VERSION=repair-v1.0
 MODEL_REQUEST_TIMEOUT_SECONDS=120
 MODEL_INPUT_PRICE_USD_PER_MILLION_TOKENS=<reviewed current rate>
 MODEL_OUTPUT_PRICE_USD_PER_MILLION_TOKENS=<reviewed current rate>
-OPENAI_API_KEY=<credential>
-tracefix benchmark --split development --provider openai
+GROQ_API_KEY=<credential>
+tracefix benchmark --split development --provider groq
 ```
 
-The command accepts exactly the `development` split and `openai` provider, then runs all five cases
+The command accepts exactly the `development` split and `groq` provider, then runs all five cases
 sequentially through the same one-attempt graph, policy, static checks, hardened sandbox,
 verification, evaluation, artifact publication, and cleanup used by `tracefix repair`. The
 credential is read only by the provider factory and is never added to model configuration, graph
@@ -293,7 +294,7 @@ validation, builds both fixed images, performs the explicitly authorized paid ru
 the safe report pair and metadata-only per-case artifacts. It is triggered only by
 `workflow_dispatch`; it is not a required push or pull-request check.
 
-Current limitations are one explicitly configured OpenAI model, five development cases, one attempt,
+Current limitations are one explicitly configured Groq model, five development cases, one attempt,
 no retries, no schedules, no provider/model comparisons, no confidence intervals, no persistence,
 and no production observability.
 

@@ -26,11 +26,11 @@ from app.cli import (
 )
 from app.evaluation.benchmark import BenchmarkExecutionStatus, BenchmarkReport
 from app.evaluation.live_model import (
+    GroqCompletionStatus,
+    GroqTransportRequest,
+    GroqTransportResponse,
     LiveBenchmarkConfiguration,
-    OpenAICompletionStatus,
-    OpenAITransportRequest,
-    OpenAITransportResponse,
-    create_openai_model_provider,
+    create_groq_model_provider,
     load_live_benchmark_configuration,
 )
 from app.evaluation.reporting import LocalBenchmarkReportWriter
@@ -132,15 +132,16 @@ def require_docker_and_images() -> None:
 
 def _environment(runtime_temp: Path) -> dict[str, str]:
     return {
-        "MODEL_PROVIDER": "openai",
-        "MODEL_NAME": "reviewed-model-name",
+        "MODEL_PROVIDER": "groq",
+        "MODEL_NAME": "openai/gpt-oss-120b",
         "MODEL_TEMPERATURE": "0",
+        "MODEL_REASONING_EFFORT": "low",
         "MODEL_MAX_TOKENS": "4096",
         "PROMPT_VERSION": "repair-v1.0",
         "MODEL_REQUEST_TIMEOUT_SECONDS": "120",
         "MODEL_INPUT_PRICE_USD_PER_MILLION_TOKENS": "0.15",
         "MODEL_OUTPUT_PRICE_USD_PER_MILLION_TOKENS": "0.60",
-        "OPENAI_API_KEY": "integration-credential-must-not-leak",
+        "GROQ_API_KEY": "integration-credential-must-not-leak",
         "TEMP": str(runtime_temp),
         "TMP": str(runtime_temp),
         "TMPDIR": str(runtime_temp),
@@ -157,12 +158,12 @@ class TickClock:
         return current
 
 
-class ScriptedOpenAITransport:
-    def __init__(self, requests: list[OpenAITransportRequest], *, fail: bool = False) -> None:
+class ScriptedGroqTransport:
+    def __init__(self, requests: list[GroqTransportRequest], *, fail: bool = False) -> None:
         self._requests = requests
         self._fail = fail
 
-    def complete(self, request: OpenAITransportRequest) -> OpenAITransportResponse:
+    def complete(self, request: GroqTransportRequest) -> GroqTransportResponse:
         self._requests.append(request)
         if self._fail:
             raise RuntimeError("untrusted provider failure body")
@@ -186,8 +187,8 @@ class ScriptedOpenAITransport:
                 risks=["preserve all other behavior"],
                 confidence=1.0,
             ).model_dump_json()
-        return OpenAITransportResponse(
-            status=OpenAICompletionStatus.COMPLETED,
+        return GroqTransportResponse(
+            status=GroqCompletionStatus.COMPLETED,
             raw_json=raw_json,
             input_tokens=100,
             output_tokens=50,
@@ -197,7 +198,7 @@ class ScriptedOpenAITransport:
 def _application(
     invocation: Path,
     runtime_temp: Path,
-    requests: list[OpenAITransportRequest],
+    requests: list[GroqTransportRequest],
     *,
     fail_provider: bool = False,
     stdout: StringIO | None = None,
@@ -232,11 +233,11 @@ def _application(
         source: object,
     ):
         assert isinstance(source, dict)
-        return create_openai_model_provider(
+        return create_groq_model_provider(
             configuration,  # type: ignore[arg-type]
             live_configuration,
             source,
-            transport_factory=lambda credential, timeout: ScriptedOpenAITransport(
+            transport_factory=lambda credential, timeout: ScriptedGroqTransport(
                 requests, fail=fail_provider
             ),
             monotonic_clock=TickClock(),
@@ -269,7 +270,7 @@ def test_injected_live_transport_runs_all_cases_through_real_pipeline(tmp_path: 
     runtime_temp = (tmp_path / "runtime").resolve()
     invocation.mkdir()
     runtime_temp.mkdir()
-    requests: list[OpenAITransportRequest] = []
+    requests: list[GroqTransportRequest] = []
     application = _application(invocation, runtime_temp, requests)
 
     entry_point = next(
@@ -279,7 +280,7 @@ def test_injected_live_transport_runs_all_cases_through_real_pipeline(tmp_path: 
     )
     assert entry_point.value == "app.cli:main"
     result = entry_point.load()(
-        ["benchmark", "--split", "development", "--provider", "openai"],
+        ["benchmark", "--split", "development", "--provider", "groq"],
         application_factory=_unused_repair_application,
         benchmark_application_factory=lambda: application,
     )
@@ -292,6 +293,7 @@ def test_injected_live_transport_runs_all_cases_through_real_pipeline(tmp_path: 
         report_path.read_text(encoding="utf-8"), strict=True
     )
     assert report.execution_status is BenchmarkExecutionStatus.COMPLETED
+    assert report.provider == "groq"
     assert report.counts.repair_success == 5
     assert report.aggregate_usage.input_tokens == 1000
     assert report.aggregate_usage.output_tokens == 500
@@ -300,7 +302,7 @@ def test_injected_live_transport_runs_all_cases_through_real_pipeline(tmp_path: 
     published = report_path.read_text(encoding="utf-8") + (
         report_path.with_suffix(".md").read_text(encoding="utf-8")
     )
-    assert _environment(runtime_temp)["OPENAI_API_KEY"] not in published
+    assert _environment(runtime_temp)["GROQ_API_KEY"] not in published
     assert not tuple(runtime_temp.glob("tracefix-run-*"))
 
 
@@ -309,11 +311,11 @@ def test_provider_failure_publishes_partial_report_and_stops(tmp_path: Path) -> 
     runtime_temp = (tmp_path / "runtime-failure").resolve()
     invocation.mkdir()
     runtime_temp.mkdir()
-    requests: list[OpenAITransportRequest] = []
+    requests: list[GroqTransportRequest] = []
     application = _application(invocation, runtime_temp, requests, fail_provider=True)
 
     result = main(
-        ["benchmark", "--split", "development", "--provider", "openai"],
+        ["benchmark", "--split", "development", "--provider", "groq"],
         application_factory=_unused_repair_application,
         benchmark_application_factory=lambda: application,
     )
@@ -354,7 +356,7 @@ def test_console_failure_discards_completed_report_pair(
     application = _application(invocation, runtime_temp, [], stdout=FailingOutput())
 
     result = main(
-        ["benchmark", "--split", "development", "--provider", "openai"],
+        ["benchmark", "--split", "development", "--provider", "groq"],
         application_factory=_unused_repair_application,
         benchmark_application_factory=lambda: application,
     )
@@ -368,7 +370,7 @@ def test_preflight_failure_does_not_fabricate_report(tmp_path: Path) -> None:
     runtime_temp = (tmp_path / "runtime-preflight-failure").resolve()
     invocation.mkdir()
     runtime_temp.mkdir()
-    requests: list[OpenAITransportRequest] = []
+    requests: list[GroqTransportRequest] = []
     application = _application(
         invocation,
         runtime_temp,
@@ -377,7 +379,7 @@ def test_preflight_failure_does_not_fabricate_report(tmp_path: Path) -> None:
     )
 
     result = main(
-        ["benchmark", "--split", "development", "--provider", "openai"],
+        ["benchmark", "--split", "development", "--provider", "groq"],
         application_factory=_unused_repair_application,
         benchmark_application_factory=lambda: application,
     )

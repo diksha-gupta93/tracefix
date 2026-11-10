@@ -61,7 +61,7 @@ def test_cli_help_and_argument_surface(capsys: pytest.CaptureFixture[str]) -> No
     assert benchmark_help_exit.value.code == 0
     benchmark_help = capsys.readouterr().out
     assert "--split {development}" in benchmark_help
-    assert "--provider {openai}" in benchmark_help
+    assert "--provider {groq}" in benchmark_help
     with pytest.raises(SystemExit) as missing_exit:
         main([], application_factory=_unknown_application)
     assert missing_exit.value.code == 2
@@ -75,10 +75,11 @@ def test_cli_help_and_argument_surface(capsys: pytest.CaptureFixture[str]) -> No
     [
         ["benchmark"],
         ["benchmark", "--split", "development"],
-        ["benchmark", "--provider", "openai"],
-        ["benchmark", "--split", "Development", "--provider", "openai"],
-        ["benchmark", "--split", "development", "--provider", "OpenAI"],
-        ["benchmark", "--split", "development", "--provider", "openai", "extra"],
+        ["benchmark", "--provider", "groq"],
+        ["benchmark", "--split", "Development", "--provider", "groq"],
+        ["benchmark", "--split", "development", "--provider", "Groq"],
+        ["benchmark", "--split", "development", "--provider", "openai"],
+        ["benchmark", "--split", "development", "--provider", "groq", "extra"],
     ],
 )
 def test_invalid_benchmark_arguments_have_no_application_side_effects(

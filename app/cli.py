@@ -572,7 +572,7 @@ class BenchmarkApplication:
             run_benchmark_cases,
         )
         from app.evaluation.live_model import (
-            OPENAI_PROVIDER_NAME,
+            GROQ_PROVIDER_NAME,
             apply_live_model_configuration,
         )
         from app.evaluation.reporting import (
@@ -581,7 +581,7 @@ class BenchmarkApplication:
         )
 
         dependencies = self._dependencies
-        if split != "development" or provider_argument != OPENAI_PROVIDER_NAME:
+        if split != "development" or provider_argument != GROQ_PROVIDER_NAME:
             raise CliInputError("benchmark arguments are invalid")
         try:
             benchmark_run_id = dependencies.run_id_factory()
@@ -715,7 +715,7 @@ def default_application_factory() -> RepairApplication:
 def default_benchmark_application_factory() -> BenchmarkApplication:
     from app.agent.model import load_model_configuration
     from app.evaluation.live_model import (
-        create_openai_model_provider,
+        create_groq_model_provider,
         load_live_benchmark_configuration,
     )
     from app.evaluation.reporting import LocalBenchmarkReportWriter
@@ -727,7 +727,7 @@ def default_benchmark_application_factory() -> BenchmarkApplication:
             development_case_loader=load_development_cases,
             configuration_loader=load_model_configuration,
             live_configuration_loader=load_live_benchmark_configuration,
-            live_provider_factory=create_openai_model_provider,
+            live_provider_factory=create_groq_model_provider,
             report_writer=LocalBenchmarkReportWriter(),
             clock=_clock,
             run_id_factory=lambda: uuid.uuid4().hex,
@@ -758,7 +758,7 @@ def _parser() -> argparse.ArgumentParser:
     repair.add_argument("case_id")
     benchmark = commands.add_parser("benchmark")
     benchmark.add_argument("--split", required=True, choices=("development",))
-    benchmark.add_argument("--provider", required=True, choices=("openai",))
+    benchmark.add_argument("--provider", required=True, choices=("groq",))
     return parser
 
 

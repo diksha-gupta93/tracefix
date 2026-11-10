@@ -8,7 +8,7 @@ from collections.abc import Callable, Mapping
 from decimal import Decimal, InvalidOperation, localcontext
 from enum import StrEnum
 from time import monotonic
-from typing import Annotated, Protocol, cast
+from typing import Annotated, Literal, Protocol, cast
 
 from pydantic import (
     BaseModel,
@@ -19,6 +19,7 @@ from pydantic import (
 )
 
 from app.agent.model import SUPPORTED_PROMPT_VERSION, ModelProvider
+from app.agent.planning import MAX_PROVIDER_RESPONSE_UTF8_BYTES
 from app.agent.schemas import (
     ModelCallUsage,
     ModelConfiguration,
@@ -30,14 +31,19 @@ from app.agent.schemas import (
 )
 from app.evaluation.deterministic.candidate import CandidateModelUsage
 
-OPENAI_PROVIDER_NAME = "openai"
-OPENAI_CREDENTIAL_NAME = "OPENAI_API_KEY"
+GROQ_PROVIDER_NAME = "groq"
+GROQ_MODEL_NAME = "openai/gpt-oss-120b"
+GROQ_CREDENTIAL_NAME = "GROQ_API_KEY"
+GROQ_REASONING_EFFORT: Literal["low"] = "low"
+GROQ_API_BASE_URL = "https://api.groq.com"
+GROQ_MAX_COMPLETION_TOKENS = 4096
+_REASONING_EFFORT_NAME = "MODEL_REASONING_EFFORT"
 _TIMEOUT_NAME = "MODEL_REQUEST_TIMEOUT_SECONDS"
 _INPUT_PRICE_NAME = "MODEL_INPUT_PRICE_USD_PER_MILLION_TOKENS"
 _OUTPUT_PRICE_NAME = "MODEL_OUTPUT_PRICE_USD_PER_MILLION_TOKENS"
 _INTEGER = re.compile(r"^[0-9]+$")
 _DECIMAL = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
-_SDK_VERSION = re.compile(r"^(?P<major>[0-9]+)(?:\.|$)")
+_SDK_VERSION = re.compile(r"^(?P<major>[0-9]+)\.(?P<minor>[0-9]+)(?:\.|$)")
 _MILLION = Decimal(1_000_000)
 _MAX_TOKEN_COUNT = 2**63 - 1
 
@@ -66,6 +72,7 @@ NonNegativeDecimal = Annotated[
 class LiveBenchmarkConfiguration(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
+    reasoning_effort: Literal["low"] = GROQ_REASONING_EFFORT
     request_timeout_seconds: Annotated[int, Field(strict=True, ge=1, le=300)]
     input_price_usd_per_million_tokens: NonNegativeDecimal
     output_price_usd_per_million_tokens: NonNegativeDecimal
@@ -92,11 +99,18 @@ def _parse_price(value: object) -> Decimal:
     return parsed
 
 
+def _parse_reasoning_effort(value: object) -> Literal["low"]:
+    if value != GROQ_REASONING_EFFORT or type(value) is not str:
+        raise ValueError
+    return GROQ_REASONING_EFFORT
+
+
 def load_live_benchmark_configuration(
     environment: Mapping[str, str],
 ) -> LiveBenchmarkConfiguration:
     try:
         return LiveBenchmarkConfiguration(
+            reasoning_effort=_parse_reasoning_effort(environment[_REASONING_EFFORT_NAME]),
             request_timeout_seconds=_parse_timeout(environment[_TIMEOUT_NAME]),
             input_price_usd_per_million_tokens=_parse_price(environment[_INPUT_PRICE_NAME]),
             output_price_usd_per_million_tokens=_parse_price(environment[_OUTPUT_PRICE_NAME]),
@@ -119,20 +133,22 @@ def apply_live_model_configuration(
         raise LiveModelConfigurationError("live model configuration is invalid") from None
     if (
         type(provider_argument) is not str
-        or provider_argument != OPENAI_PROVIDER_NAME
+        or provider_argument != GROQ_PROVIDER_NAME
         or checked.provider != provider_argument
+        or checked.model_name != GROQ_MODEL_NAME
+        or checked.max_output_tokens != GROQ_MAX_COMPLETION_TOKENS
         or checked.prompt_version != SUPPORTED_PROMPT_VERSION
     ):
         raise LiveModelConfigurationError("live model configuration is unsupported")
     return checked
 
 
-class OpenAICompletionStatus(StrEnum):
+class GroqCompletionStatus(StrEnum):
     COMPLETED = "completed"
     CONTENT_FAILURE = "content_failure"
 
 
-class OpenAITransportRequest(BaseModel):
+class GroqTransportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     operation: ModelOperation
@@ -145,19 +161,20 @@ class OpenAITransportRequest(BaseModel):
     attempt_number: int = Field(strict=True, ge=1, le=1)
     response_schema_json: str = Field(min_length=1)
     request_timeout_seconds: int = Field(strict=True, ge=1, le=300)
+    reasoning_effort: Literal["low"]
 
 
-class OpenAITransportResponse(BaseModel):
+class GroqTransportResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    status: OpenAICompletionStatus
+    status: GroqCompletionStatus
     raw_json: str
     input_tokens: int = Field(strict=True, ge=0, le=2**63 - 1)
     output_tokens: int = Field(strict=True, ge=0, le=2**63 - 1)
 
 
-class OpenAITransport(Protocol):
-    def complete(self, request: OpenAITransportRequest) -> OpenAITransportResponse: ...
+class GroqTransport(Protocol):
+    def complete(self, request: GroqTransportRequest) -> GroqTransportResponse: ...
 
 
 def _attribute(value: object, name: str) -> object:
@@ -168,52 +185,98 @@ def _attribute(value: object, name: str) -> object:
 
 
 def _integer_attribute(value: object, name: str) -> int:
-    candidate = _attribute(value, name)
+    try:
+        candidate = cast(object, getattr(value, name))
+    except (AttributeError, TypeError):
+        raise LiveModelProviderError("provider usage is invalid") from None
     if type(candidate) is not int or not 0 <= candidate <= _MAX_TOKEN_COUNT:
         raise LiveModelProviderError("provider usage is invalid")
     return candidate
 
 
-def _sdk_constructor(module: object) -> Callable[..., object]:
+def _sdk_components(module: object) -> tuple[Callable[..., object], type[object]]:
     version = _attribute(module, "__version__")
     match = _SDK_VERSION.match(version) if type(version) is str else None
-    if match is None or int(match.group("major")) != 2:
+    if match is None or int(match.group("major")) != 1 or int(match.group("minor")) < 7:
         raise LiveModelProviderError("live provider SDK version is unsupported")
-    return cast(Callable[..., object], _attribute(module, "OpenAI"))
+    constructor = cast(Callable[..., object], _attribute(module, "Groq"))
+    types = _attribute(module, "types")
+    chat_types = _attribute(types, "chat")
+    response_type = _attribute(chat_types, "ChatCompletion")
+    if not isinstance(response_type, type):
+        raise LiveModelProviderError("live provider SDK version is unsupported")
+    return constructor, response_type
 
 
-def _completed_output(response: object) -> tuple[OpenAICompletionStatus, str]:
-    status = _attribute(response, "status")
-    if status == "incomplete":
-        return OpenAICompletionStatus.CONTENT_FAILURE, "{}"
-    if status != "completed":
-        raise LiveModelProviderError("provider response did not complete")
-    output = _attribute(response, "output")
-    if type(output) is not list or len(output) != 1:
-        return OpenAICompletionStatus.CONTENT_FAILURE, "{}"
-    message = output[0]
-    if _attribute(message, "type") != "message":
-        return OpenAICompletionStatus.CONTENT_FAILURE, "{}"
+def _optional_attribute(value: object, name: str) -> object | None:
+    try:
+        return cast(object, getattr(value, name))
+    except AttributeError:
+        return None
+    except TypeError:
+        raise LiveModelProviderError("provider response is invalid") from None
+
+
+def _completed_output(response: object) -> tuple[GroqCompletionStatus, str]:
+    if _attribute(response, "object") != "chat.completion":
+        raise LiveModelProviderError("provider response is invalid")
+    choices = _attribute(response, "choices")
+    if type(choices) is not list or len(choices) != 1:
+        raise LiveModelProviderError("provider response is invalid")
+    choice = choices[0]
+    choice_index = _attribute(choice, "index")
+    if type(choice_index) is not int or choice_index != 0:
+        raise LiveModelProviderError("provider response is invalid")
+    message = _attribute(choice, "message")
+    if _attribute(message, "role") != "assistant":
+        raise LiveModelProviderError("provider response is invalid")
+    finish_reason = _attribute(choice, "finish_reason")
+    if type(finish_reason) is not str:
+        raise LiveModelProviderError("provider response is invalid")
+    if finish_reason not in {
+        "stop",
+        "length",
+        "tool_calls",
+        "function_call",
+        "content_filter",
+        "cancelled",
+        "incomplete",
+    }:
+        raise LiveModelProviderError("provider response is invalid")
+    tool_calls = _attribute(message, "tool_calls")
+    function_call = _attribute(message, "function_call")
+    executed_tools = _attribute(message, "executed_tools")
+    refusal = _optional_attribute(message, "refusal")
+    if (
+        finish_reason != "stop"
+        or tool_calls not in (None, [])
+        or function_call is not None
+        or executed_tools not in (None, [])
+        or refusal is not None
+    ):
+        return GroqCompletionStatus.CONTENT_FAILURE, "{}"
     content = _attribute(message, "content")
-    if type(content) is not list or len(content) != 1:
-        return OpenAICompletionStatus.CONTENT_FAILURE, "{}"
-    output_item = content[0]
-    if _attribute(output_item, "type") != "output_text":
-        return OpenAICompletionStatus.CONTENT_FAILURE, "{}"
-    text = _attribute(output_item, "text")
-    if type(text) is not str or not text:
-        return OpenAICompletionStatus.CONTENT_FAILURE, "{}"
-    return OpenAICompletionStatus.COMPLETED, text
+    if type(content) is not str or not content:
+        return GroqCompletionStatus.CONTENT_FAILURE, "{}"
+    try:
+        response_size = len(content.encode("utf-8"))
+    except UnicodeError:
+        raise LiveModelProviderError("provider response is invalid") from None
+    if response_size > MAX_PROVIDER_RESPONSE_UTF8_BYTES:
+        return GroqCompletionStatus.CONTENT_FAILURE, "{}"
+    return GroqCompletionStatus.COMPLETED, content
 
 
-class SdkOpenAITransport:
-    """The only boundary that imports and observes objects from the optional OpenAI SDK."""
+class SdkGroqTransport:
+    """The only boundary that imports and observes objects from the optional Groq SDK."""
 
     def __init__(self, api_key: str, request_timeout_seconds: int) -> None:
         try:
-            module = importlib.import_module("openai")
-            self._client = _sdk_constructor(module)(
+            module = importlib.import_module("groq")
+            constructor, self._response_type = _sdk_components(module)
+            self._client = constructor(
                 api_key=api_key,
+                base_url=GROQ_API_BASE_URL,
                 timeout=float(request_timeout_seconds),
                 max_retries=0,
             )
@@ -224,49 +287,49 @@ class SdkOpenAITransport:
         except Exception:
             raise LiveModelProviderError("live provider is unavailable") from None
 
-    def complete(self, request: OpenAITransportRequest) -> OpenAITransportResponse:
-        checked = OpenAITransportRequest.model_validate(
+    def complete(self, request: GroqTransportRequest) -> GroqTransportResponse:
+        checked = GroqTransportRequest.model_validate(
             request.model_dump(warnings="none"), strict=True
         )
         try:
             schema_value: object = json.loads(checked.response_schema_json)
             if type(schema_value) is not dict:
                 raise ValueError
-            responses = _attribute(self._client, "responses")
-            create = cast(Callable[..., object], _attribute(responses, "create"))
+            chat = _attribute(self._client, "chat")
+            completions = _attribute(chat, "completions")
+            create = cast(Callable[..., object], _attribute(completions, "create"))
             response = create(
                 model=checked.model_name,
-                input=checked.rendered_prompt,
-                temperature=checked.temperature,
-                max_output_tokens=checked.max_output_tokens,
-                metadata={
-                    "case_id": checked.case_id,
-                    "operation": checked.operation.value,
-                    "attempt_number": str(checked.attempt_number),
-                    "prompt_version": checked.prompt_version,
-                },
-                text={
-                    "format": {
-                        "type": "json_schema",
+                messages=[{"role": "user", "content": checked.rendered_prompt}],
+                reasoning_effort=checked.reasoning_effort,
+                include_reasoning=False,
+                max_completion_tokens=checked.max_output_tokens,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
                         "name": checked.operation.value,
                         "strict": True,
                         "schema": schema_value,
-                    }
+                    },
                 },
                 tools=[],
                 tool_choice="none",
                 stream=False,
-                store=False,
+                n=1,
                 timeout=float(checked.request_timeout_seconds),
             )
-            usage = _attribute(response, "usage")
-            input_tokens = _integer_attribute(usage, "input_tokens")
-            output_tokens = _integer_attribute(usage, "output_tokens")
+            if type(response) is not self._response_type:
+                raise LiveModelProviderError("provider response is invalid")
+            status, raw_json = _completed_output(response)
+            usage = _optional_attribute(response, "usage")
+            if usage is None:
+                raise LiveModelProviderError("provider usage is invalid")
+            input_tokens = _integer_attribute(usage, "prompt_tokens")
+            output_tokens = _integer_attribute(usage, "completion_tokens")
             total_tokens = _integer_attribute(usage, "total_tokens")
             if input_tokens + output_tokens != total_tokens:
                 raise LiveModelProviderError("provider usage is invalid")
-            status, raw_json = _completed_output(response)
-            return OpenAITransportResponse(
+            return GroqTransportResponse(
                 status=status,
                 raw_json=raw_json,
                 input_tokens=input_tokens,
@@ -281,7 +344,7 @@ class SdkOpenAITransport:
 
 
 MonotonicClock = Callable[[], float]
-TransportFactory = Callable[[str, int], OpenAITransport]
+TransportFactory = Callable[[str, int], GroqTransport]
 
 
 def _schema_json(operation: ModelOperation) -> str:
@@ -336,10 +399,10 @@ def calculate_estimated_cost_usd(
         )
 
 
-class OpenAIModelProvider(ModelProvider):
+class GroqModelProvider(ModelProvider):
     def __init__(
         self,
-        transport: OpenAITransport,
+        transport: GroqTransport,
         configuration: LiveBenchmarkConfiguration,
         monotonic_clock: MonotonicClock = monotonic,
     ) -> None:
@@ -357,7 +420,7 @@ class OpenAIModelProvider(ModelProvider):
             checked = ModelProviderRequest.model_validate(
                 request.model_dump(warnings="none"), strict=True
             )
-            transport_request = OpenAITransportRequest(
+            transport_request = GroqTransportRequest(
                 operation=checked.operation,
                 case_id=checked.case_id,
                 model_name=checked.model_name,
@@ -368,6 +431,7 @@ class OpenAIModelProvider(ModelProvider):
                 attempt_number=checked.attempt_number,
                 response_schema_json=_schema_json(checked.operation),
                 request_timeout_seconds=self._configuration.request_timeout_seconds,
+                reasoning_effort=self._configuration.reasoning_effort,
             )
             started = self._clock()
             response = self._transport.complete(transport_request)
@@ -380,7 +444,7 @@ class OpenAIModelProvider(ModelProvider):
                 or completed < started
             ):
                 raise ValueError
-            checked_response = OpenAITransportResponse.model_validate(
+            checked_response = GroqTransportResponse.model_validate(
                 response.model_dump(warnings="none"), strict=True
             )
             usage = ModelCallUsage(
@@ -423,14 +487,14 @@ class OpenAIModelProvider(ModelProvider):
             raise LiveModelProviderError("provider usage is invalid") from None
 
 
-def create_openai_model_provider(
+def create_groq_model_provider(
     configuration: ModelConfiguration,
     live_configuration: LiveBenchmarkConfiguration,
     environment: Mapping[str, str],
     *,
-    transport_factory: TransportFactory = SdkOpenAITransport,
+    transport_factory: TransportFactory = SdkGroqTransport,
     monotonic_clock: MonotonicClock = monotonic,
-) -> OpenAIModelProvider:
+) -> GroqModelProvider:
     try:
         checked = ModelConfiguration.model_validate(
             configuration.model_dump(warnings="none"), strict=True
@@ -438,16 +502,19 @@ def create_openai_model_provider(
         live_checked = LiveBenchmarkConfiguration.model_validate(
             live_configuration.model_dump(warnings="none"), strict=True
         )
-        credential = environment[OPENAI_CREDENTIAL_NAME]
+        credential = environment[GROQ_CREDENTIAL_NAME]
         if (
             type(credential) is not str
             or not credential.strip()
-            or checked.provider != OPENAI_PROVIDER_NAME
+            or checked.provider != GROQ_PROVIDER_NAME
+            or checked.model_name != GROQ_MODEL_NAME
+            or checked.max_output_tokens != GROQ_MAX_COMPLETION_TOKENS
             or checked.prompt_version != SUPPORTED_PROMPT_VERSION
+            or live_checked.reasoning_effort != GROQ_REASONING_EFFORT
         ):
             raise ValueError
         transport = transport_factory(credential, live_checked.request_timeout_seconds)
-        return OpenAIModelProvider(transport, live_checked, monotonic_clock)
+        return GroqModelProvider(transport, live_checked, monotonic_clock)
     except (KeyboardInterrupt, SystemExit):
         raise
     except LiveModelProviderError:

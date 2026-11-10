@@ -20,7 +20,7 @@ dev = [
     "pytest>=8.4,<9",
     "ruff>=0.12,<0.13",
 ]
-live = ["openai>=2,<3"]
+live = ["groq>=1.7,<2"]
 
 [tool.setuptools.packages.find]
 include = ["app", "app.*"]
