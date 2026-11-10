@@ -194,14 +194,14 @@ def _integer_attribute(value: object, name: str) -> int:
     return candidate
 
 
-def _sdk_components(module: object) -> tuple[Callable[..., object], type[object]]:
+def _sdk_components(
+    module: object, chat_types: object
+) -> tuple[Callable[..., object], type[object]]:
     version = _attribute(module, "__version__")
     match = _SDK_VERSION.match(version) if type(version) is str else None
     if match is None or int(match.group("major")) != 1 or int(match.group("minor")) < 7:
         raise LiveModelProviderError("live provider SDK version is unsupported")
     constructor = cast(Callable[..., object], _attribute(module, "Groq"))
-    types = _attribute(module, "types")
-    chat_types = _attribute(types, "chat")
     response_type = _attribute(chat_types, "ChatCompletion")
     if not isinstance(response_type, type):
         raise LiveModelProviderError("live provider SDK version is unsupported")
@@ -273,7 +273,8 @@ class SdkGroqTransport:
     def __init__(self, api_key: str, request_timeout_seconds: int) -> None:
         try:
             module = importlib.import_module("groq")
-            constructor, self._response_type = _sdk_components(module)
+            chat_types = importlib.import_module("groq.types.chat")
+            constructor, self._response_type = _sdk_components(module, chat_types)
             self._client = constructor(
                 api_key=api_key,
                 base_url=GROQ_API_BASE_URL,

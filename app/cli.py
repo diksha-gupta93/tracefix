@@ -588,6 +588,12 @@ class BenchmarkApplication:
             started_at = dependencies.clock()
             if type(benchmark_run_id) is not str or _RUN_ID.fullmatch(benchmark_run_id) is None:
                 raise ValueError
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            self._safe_error("tracefix: benchmark preflight failed: benchmark_run_id\n")
+            return 6
+        try:
             base_configuration = dependencies.configuration_loader(dependencies.environment)
             base_configuration = ModelConfiguration.model_validate(
                 base_configuration.model_dump(warnings="none"), strict=True
@@ -595,15 +601,33 @@ class BenchmarkApplication:
             configuration = apply_live_model_configuration(
                 base_configuration, provider_argument, dependencies.environment
             )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            self._safe_error("tracefix: benchmark preflight failed: model_configuration\n")
+            return 6
+        try:
             live_configuration = dependencies.live_configuration_loader(dependencies.environment)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            self._safe_error("tracefix: benchmark preflight failed: live_configuration\n")
+            return 6
+        try:
             first_provider = dependencies.live_provider_factory(
                 configuration, live_configuration, dependencies.environment
             )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            self._safe_error("tracefix: benchmark preflight failed: provider_initialization\n")
+            return 6
+        try:
             cases = dependencies.development_case_loader()
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception:
-            self._safe_error("tracefix: benchmark preflight failed\n")
+            self._safe_error("tracefix: benchmark preflight failed: benchmark_cases\n")
             return 6
 
         providers: list[ModelProvider] = [first_provider]

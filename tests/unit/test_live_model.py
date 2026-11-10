@@ -275,8 +275,15 @@ def _sdk_module(client: type[object], version: str = "1.7.0") -> object:
     return SimpleNamespace(
         __version__=version,
         Groq=client,
-        types=SimpleNamespace(chat=SimpleNamespace(ChatCompletion=FakeChatCompletion)),
     )
+
+
+def _sdk_importer(client: type[object], version: str = "1.7.0"):
+    modules = {
+        "groq": _sdk_module(client, version),
+        "groq.types.chat": SimpleNamespace(ChatCompletion=FakeChatCompletion),
+    }
+    return modules.__getitem__
 
 
 def _chat_completion(
@@ -328,7 +335,7 @@ def test_sdk_transport_uses_exact_chat_completions_request(
     monkeypatch.setenv("GROQ_BASE_URL", "https://credential-stealing.invalid")
     monkeypatch.setattr(
         "app.evaluation.live_model.importlib.import_module",
-        lambda name: _sdk_module(Client) if name == "groq" else None,
+        _sdk_importer(Client),
     )
     transport = SdkGroqTransport("credential", 45)
     response = transport.complete(transport_request())
@@ -491,7 +498,7 @@ def _install_fake_sdk(monkeypatch: pytest.MonkeyPatch, completions: object) -> N
 
     monkeypatch.setattr(
         "app.evaluation.live_model.importlib.import_module",
-        lambda name: _sdk_module(Client) if name == "groq" else None,
+        _sdk_importer(Client),
     )
 
 
@@ -501,7 +508,7 @@ def test_sdk_transport_rejects_unsupported_sdk_version(
 ) -> None:
     monkeypatch.setattr(
         "app.evaluation.live_model.importlib.import_module",
-        lambda name: _sdk_module(object, version) if name == "groq" else None,
+        _sdk_importer(object, version),
     )
     with pytest.raises(LiveModelProviderError, match="SDK version"):
         SdkGroqTransport("credential", 45)
@@ -517,7 +524,7 @@ def test_sdk_transport_accepts_supported_sdk_version(
 
     monkeypatch.setattr(
         "app.evaluation.live_model.importlib.import_module",
-        lambda name: _sdk_module(Client, version) if name == "groq" else None,
+        _sdk_importer(Client, version),
     )
     SdkGroqTransport("credential", 45)
 
@@ -546,7 +553,7 @@ def test_sdk_transport_maps_missing_dependency_and_provider_exception_safely(
 
     monkeypatch.setattr(
         "app.evaluation.live_model.importlib.import_module",
-        lambda name: _sdk_module(Client) if name == "groq" else None,
+        _sdk_importer(Client),
     )
     transport = SdkGroqTransport("credential", 45)
     with pytest.raises(LiveModelProviderError, match="provider request failed") as failed:
@@ -564,7 +571,7 @@ def test_sdk_transport_maps_client_construction_failure_safely(
 
     monkeypatch.setattr(
         "app.evaluation.live_model.importlib.import_module",
-        lambda name: _sdk_module(Client) if name == "groq" else None,
+        _sdk_importer(Client),
     )
     with pytest.raises(LiveModelProviderError, match="provider is unavailable") as failed:
         SdkGroqTransport("credential", 45)

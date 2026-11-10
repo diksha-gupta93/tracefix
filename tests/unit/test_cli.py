@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from datetime import UTC, datetime
+from decimal import Decimal
 from io import StringIO
 from pathlib import Path
 
 import pytest
 
+from app.agent.schemas import ModelConfiguration
 from app.cli import (
     ApplicationDependencies,
+    BenchmarkApplication,
+    BenchmarkApplicationDependencies,
     LocalWorkspaceManager,
     ProviderRegistry,
     RepairApplication,
@@ -16,6 +21,7 @@ from app.cli import (
     default_application_factory,
     main,
 )
+from app.evaluation.live_model import LiveBenchmarkConfiguration
 from benchmarks.loader import BenchmarkLoadError, load_trusted_case
 
 
@@ -96,6 +102,68 @@ def test_invalid_benchmark_arguments_have_no_application_side_effects(
         main(arguments, benchmark_application_factory=forbidden_factory)
     assert raised.value.code == 2
     assert not called
+
+
+@pytest.mark.parametrize(
+    "failing_stage",
+    (
+        "benchmark_run_id",
+        "model_configuration",
+        "live_configuration",
+        "provider_initialization",
+        "benchmark_cases",
+    ),
+)
+def test_benchmark_preflight_failure_is_safely_classified(failing_stage: str) -> None:
+    sensitive_detail = "credential-or-provider-detail-must-not-escape"
+    stdout = StringIO()
+    stderr = StringIO()
+    model_configuration = ModelConfiguration(
+        provider="groq",
+        model_name="openai/gpt-oss-120b",
+        temperature=0.0,
+        max_output_tokens=4096,
+        prompt_version="repair-v1.0",
+    )
+    live_configuration = LiveBenchmarkConfiguration(
+        reasoning_effort="low",
+        request_timeout_seconds=120,
+        input_price_usd_per_million_tokens=Decimal(0),
+        output_price_usd_per_million_tokens=Decimal(0),
+    )
+
+    def value(stage: str, result: object) -> object:
+        if stage == failing_stage:
+            raise RuntimeError(sensitive_detail)
+        return result
+
+    application = BenchmarkApplication(
+        BenchmarkApplicationDependencies(
+            repair_application=NeverCalled(),  # type: ignore[arg-type]
+            development_case_loader=lambda: value("benchmark_cases", ()),  # type: ignore[arg-type,return-value]
+            configuration_loader=lambda environment=None: value(
+                "model_configuration", model_configuration
+            ),  # type: ignore[arg-type,return-value]
+            live_configuration_loader=lambda environment: value(
+                "live_configuration", live_configuration
+            ),  # type: ignore[arg-type,return-value]
+            live_provider_factory=lambda configuration, live, environment: value(
+                "provider_initialization", NeverCalled()
+            ),  # type: ignore[arg-type,return-value]
+            report_writer=NeverCalled(),
+            clock=lambda: datetime.now(UTC),
+            run_id_factory=lambda: value("benchmark_run_id", "a" * 32),  # type: ignore[return-value]
+            invocation_directory=NeverCalled(),
+            environment={"GROQ_API_KEY": sensitive_detail},
+            stdout=stdout,
+            stderr=stderr,
+        )
+    )
+
+    assert application.benchmark("development", "groq") == 6
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == f"tracefix: benchmark preflight failed: {failing_stage}\n"
+    assert sensitive_detail not in stderr.getvalue()
 
 
 @pytest.mark.parametrize("case_id", ["../case", "C:\\case", "/case", "UPPER", "a" * 129])
