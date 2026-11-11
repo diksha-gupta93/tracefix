@@ -7,8 +7,10 @@ import re
 from collections.abc import Callable, Mapping
 from decimal import Decimal, InvalidOperation, localcontext
 from enum import StrEnum
-from time import monotonic
-from typing import Annotated, Literal, Protocol, cast
+from functools import partial
+from threading import Lock
+from time import monotonic, sleep
+from typing import Annotated, Literal, Protocol, TypeVar, cast
 
 from pydantic import (
     BaseModel,
@@ -37,6 +39,7 @@ GROQ_CREDENTIAL_NAME = "GROQ_API_KEY"
 GROQ_REASONING_EFFORT: Literal["low"] = "low"
 GROQ_API_BASE_URL = "https://api.groq.com"
 GROQ_MAX_COMPLETION_TOKENS = 4096
+GROQ_LIVE_BENCHMARK_REQUEST_INTERVAL_SECONDS = 61.0
 _REASONING_EFFORT_NAME = "MODEL_REASONING_EFFORT"
 _TIMEOUT_NAME = "MODEL_REQUEST_TIMEOUT_SECONDS"
 _INPUT_PRICE_NAME = "MODEL_INPUT_PRICE_USD_PER_MILLION_TOKENS"
@@ -174,7 +177,11 @@ class GroqTransportResponse(BaseModel):
 
 
 class GroqTransport(Protocol):
-    def complete(self, request: GroqTransportRequest) -> GroqTransportResponse: ...
+    def complete(
+        self,
+        request: GroqTransportRequest,
+        request_pacer: GroqRequestPacer,
+    ) -> tuple[GroqTransportResponse, float]: ...
 
 
 def _attribute(value: object, name: str) -> object:
@@ -288,7 +295,11 @@ class SdkGroqTransport:
         except Exception:
             raise LiveModelProviderError("live provider is unavailable") from None
 
-    def complete(self, request: GroqTransportRequest) -> GroqTransportResponse:
+    def complete(
+        self,
+        request: GroqTransportRequest,
+        request_pacer: GroqRequestPacer,
+    ) -> tuple[GroqTransportResponse, float]:
         checked = GroqTransportRequest.model_validate(
             request.model_dump(warnings="none"), strict=True
         )
@@ -299,7 +310,8 @@ class SdkGroqTransport:
             chat = _attribute(self._client, "chat")
             completions = _attribute(chat, "completions")
             create = cast(Callable[..., object], _attribute(completions, "create"))
-            response = create(
+            provider_request = partial(
+                create,
                 model=checked.model_name,
                 messages=[{"role": "user", "content": checked.rendered_prompt}],
                 reasoning_effort=checked.reasoning_effort,
@@ -319,6 +331,7 @@ class SdkGroqTransport:
                 n=1,
                 timeout=float(checked.request_timeout_seconds),
             )
+            response, latency_seconds = request_pacer.pace_request(provider_request)
             if type(response) is not self._response_type:
                 raise LiveModelProviderError("provider response is invalid")
             status, raw_json = _completed_output(response)
@@ -330,11 +343,14 @@ class SdkGroqTransport:
             total_tokens = _integer_attribute(usage, "total_tokens")
             if input_tokens + output_tokens != total_tokens:
                 raise LiveModelProviderError("provider usage is invalid")
-            return GroqTransportResponse(
-                status=status,
-                raw_json=raw_json,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
+            return (
+                GroqTransportResponse(
+                    status=status,
+                    raw_json=raw_json,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                ),
+                latency_seconds,
             )
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -345,7 +361,63 @@ class SdkGroqTransport:
 
 
 MonotonicClock = Callable[[], float]
+Sleeper = Callable[[float], None]
 TransportFactory = Callable[[str, int], GroqTransport]
+PacedRequestResult = TypeVar("PacedRequestResult")
+
+
+class GroqRequestPacer:
+    """Process-local start-to-start pacing for real Groq benchmark requests."""
+
+    def __init__(
+        self,
+        *,
+        monotonic_clock: MonotonicClock = monotonic,
+        sleeper: Sleeper = sleep,
+    ) -> None:
+        self._clock = monotonic_clock
+        self._sleeper = sleeper
+        self._lock = Lock()
+        self._last_request_started: float | None = None
+
+    def _now(self) -> float:
+        try:
+            value = self._clock()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise LiveModelProviderError("live provider pacing failed") from None
+        if type(value) is not float or not math.isfinite(value):
+            raise LiveModelProviderError("live provider pacing failed")
+        return value
+
+    def pace_request(
+        self, request: Callable[[], PacedRequestResult]
+    ) -> tuple[PacedRequestResult, float]:
+        with self._lock:
+            started = self._now()
+            previous = self._last_request_started
+            if previous is not None:
+                if started < previous:
+                    raise LiveModelProviderError("live provider pacing failed")
+                earliest_start = previous + GROQ_LIVE_BENCHMARK_REQUEST_INTERVAL_SECONDS
+                remaining = earliest_start - started
+                if remaining > 0.0:
+                    try:
+                        self._sleeper(remaining)
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception:
+                        raise LiveModelProviderError("live provider pacing failed") from None
+                    started = self._now()
+                    if started < earliest_start:
+                        raise LiveModelProviderError("live provider pacing failed")
+            self._last_request_started = started
+            response = request()
+            completed = self._now()
+            if completed < started:
+                raise LiveModelProviderError("provider response is invalid")
+            return response, completed - started
 
 
 def _schema_json(operation: ModelOperation) -> str:
@@ -405,13 +477,13 @@ class GroqModelProvider(ModelProvider):
         self,
         transport: GroqTransport,
         configuration: LiveBenchmarkConfiguration,
-        monotonic_clock: MonotonicClock = monotonic,
+        request_pacer: GroqRequestPacer,
     ) -> None:
         self._transport = transport
         self._configuration = LiveBenchmarkConfiguration.model_validate(
             configuration.model_dump(warnings="none"), strict=True
         )
-        self._clock = monotonic_clock
+        self._request_pacer = request_pacer
         self._latency = 0.0
         self._input_tokens = 0
         self._output_tokens = 0
@@ -434,22 +506,15 @@ class GroqModelProvider(ModelProvider):
                 request_timeout_seconds=self._configuration.request_timeout_seconds,
                 reasoning_effort=self._configuration.reasoning_effort,
             )
-            started = self._clock()
-            response = self._transport.complete(transport_request)
-            completed = self._clock()
-            if (
-                type(started) is not float
-                or type(completed) is not float
-                or not math.isfinite(started)
-                or not math.isfinite(completed)
-                or completed < started
-            ):
-                raise ValueError
+            response, latency_seconds = self._transport.complete(
+                transport_request,
+                self._request_pacer,
+            )
             checked_response = GroqTransportResponse.model_validate(
                 response.model_dump(warnings="none"), strict=True
             )
             usage = ModelCallUsage(
-                latency_seconds=completed - started,
+                latency_seconds=latency_seconds,
                 input_tokens=checked_response.input_tokens,
                 output_tokens=checked_response.output_tokens,
             )
@@ -493,8 +558,8 @@ def create_groq_model_provider(
     live_configuration: LiveBenchmarkConfiguration,
     environment: Mapping[str, str],
     *,
+    request_pacer: GroqRequestPacer,
     transport_factory: TransportFactory = SdkGroqTransport,
-    monotonic_clock: MonotonicClock = monotonic,
 ) -> GroqModelProvider:
     try:
         checked = ModelConfiguration.model_validate(
@@ -515,7 +580,7 @@ def create_groq_model_provider(
         ):
             raise ValueError
         transport = transport_factory(credential, live_checked.request_timeout_seconds)
-        return GroqModelProvider(transport, live_checked, monotonic_clock)
+        return GroqModelProvider(transport, live_checked, request_pacer)
     except (KeyboardInterrupt, SystemExit):
         raise
     except LiveModelProviderError:

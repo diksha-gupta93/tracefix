@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal, localcontext
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -8,8 +9,10 @@ from pydantic import ValidationError
 
 from app.agent.schemas import ModelConfiguration, ModelOperation, ModelProviderRequest
 from app.evaluation.live_model import (
+    GROQ_LIVE_BENCHMARK_REQUEST_INTERVAL_SECONDS,
     GroqCompletionStatus,
     GroqModelProvider,
+    GroqRequestPacer,
     GroqTransportRequest,
     GroqTransportResponse,
     LiveBenchmarkConfiguration,
@@ -65,9 +68,54 @@ class RecordingTransport:
             ),
         ]
 
-    def complete(self, request: GroqTransportRequest) -> GroqTransportResponse:
-        self.requests.append(request)
-        return self.responses.pop(0)
+    def complete(
+        self,
+        request: GroqTransportRequest,
+        request_pacer: GroqRequestPacer,
+    ) -> tuple[GroqTransportResponse, float]:
+        def invoke() -> GroqTransportResponse:
+            self.requests.append(request)
+            return self.responses.pop(0)
+
+        return request_pacer.pace_request(invoke)
+
+
+class ManualClock:
+    def __init__(self, value: float = 0.0) -> None:
+        self.value = value
+        self.sleeps: list[float] = []
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.advance(seconds)
+
+
+def response() -> GroqTransportResponse:
+    return GroqTransportResponse(
+        status=GroqCompletionStatus.COMPLETED,
+        raw_json="{}",
+        input_tokens=1,
+        output_tokens=1,
+    )
+
+
+def pacer(clock: ManualClock | None = None) -> GroqRequestPacer:
+    selected = ManualClock() if clock is None else clock
+    return GroqRequestPacer(
+        monotonic_clock=selected,
+        sleeper=selected.sleep,
+    )
+
+
+def sdk_complete(transport: SdkGroqTransport) -> GroqTransportResponse:
+    response_value, _ = transport.complete(transport_request(), pacer())
+    return response_value
 
 
 def request(operation: ModelOperation) -> ModelProviderRequest:
@@ -97,6 +145,97 @@ def transport_request() -> GroqTransportRequest:
         request_timeout_seconds=45,
         reasoning_effort="low",
     )
+
+
+def test_request_pacer_first_request_is_immediate_and_second_waits_remaining_time() -> None:
+    assert GROQ_LIVE_BENCHMARK_REQUEST_INTERVAL_SECONDS == 61.0
+    clock = ManualClock(100.0)
+    request_pacer = pacer(clock)
+    starts: list[float] = []
+
+    def record_start() -> GroqTransportResponse:
+        starts.append(clock())
+        return response()
+
+    request_pacer.pace_request(record_start)
+    assert clock.sleeps == []
+
+    clock.advance(20.0)
+    request_pacer.pace_request(record_start)
+
+    assert clock.sleeps == [41.0]
+    assert starts == [100.0, 161.0]
+
+
+def test_request_pacer_does_not_sleep_after_full_interval_elapsed() -> None:
+    clock = ManualClock(100.0)
+    request_pacer = pacer(clock)
+
+    request_pacer.pace_request(response)
+    clock.advance(61.0)
+    request_pacer.pace_request(response)
+
+    assert clock.sleeps == []
+
+
+def test_request_pacer_measures_start_to_start_not_completion_to_start() -> None:
+    clock = ManualClock(100.0)
+    request_pacer = pacer(clock)
+
+    def three_second_request() -> GroqTransportResponse:
+        clock.advance(3.0)
+        return response()
+
+    request_pacer.pace_request(three_second_request)
+    clock.advance(17.0)
+    request_pacer.pace_request(response)
+
+    assert clock.sleeps == [41.0]
+    assert clock() == 161.0
+
+
+@pytest.mark.parametrize("failure_source", ["clock", "sleeper"])
+def test_request_pacer_failures_fail_closed_with_safe_diagnostics(
+    failure_source: str,
+) -> None:
+    sensitive = "sensitive pacing implementation detail"
+    calls = 0
+    clock = ManualClock()
+    clock_failures = 1
+    sleeper_failures = 1
+
+    def failing_clock() -> float:
+        nonlocal clock_failures
+        if clock_failures:
+            clock_failures -= 1
+            raise RuntimeError(sensitive)
+        return clock()
+
+    def failing_sleeper(seconds: float) -> None:
+        nonlocal sleeper_failures
+        if sleeper_failures:
+            sleeper_failures -= 1
+            raise RuntimeError(sensitive)
+        clock.sleep(seconds)
+
+    request_pacer = GroqRequestPacer(
+        monotonic_clock=failing_clock if failure_source == "clock" else clock,
+        sleeper=failing_sleeper if failure_source == "sleeper" else clock.sleep,
+    )
+
+    def provider_request() -> GroqTransportResponse:
+        nonlocal calls
+        calls += 1
+        return response()
+
+    if failure_source == "sleeper":
+        request_pacer.pace_request(provider_request)
+    with pytest.raises(LiveModelProviderError) as raised:
+        request_pacer.pace_request(provider_request)
+    request_pacer.pace_request(provider_request)
+
+    assert calls == (2 if failure_source == "sleeper" else 1)
+    assert sensitive not in str(raised.value)
 
 
 def test_live_configuration_is_strict_and_exact() -> None:
@@ -150,12 +289,31 @@ def test_live_model_configuration_requires_exact_profile() -> None:
 
 
 def test_adapter_maps_request_measures_usage_and_calculates_exact_cost() -> None:
-    transport = RecordingTransport()
-    clock_values = iter((10.0, 10.25, 20.0, 20.75))
+    clock = ManualClock(10.0)
+
+    class AdvancingRecordingTransport(RecordingTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self._durations = iter((0.25, 0.75))
+
+        def complete(
+            self,
+            request: GroqTransportRequest,
+            request_pacer: GroqRequestPacer,
+        ) -> tuple[GroqTransportResponse, float]:
+            def invoke() -> GroqTransportResponse:
+                self.requests.append(request)
+                result = self.responses.pop(0)
+                clock.advance(next(self._durations))
+                return result
+
+            return request_pacer.pace_request(invoke)
+
+    transport = AdvancingRecordingTransport()
     provider = GroqModelProvider(
         transport,
         live_configuration(),
-        monotonic_clock=lambda: next(clock_values),
+        pacer(clock),
     )
 
     first = provider.complete(request(ModelOperation.REPAIR_PLANNING))
@@ -179,22 +337,101 @@ def test_adapter_maps_request_measures_usage_and_calculates_exact_cost() -> None
     assert environment()["GROQ_API_KEY"] not in rendered
 
 
+def test_pacing_delay_is_excluded_from_provider_latency() -> None:
+    class AdvancingTransport:
+        def __init__(self, clock: ManualClock) -> None:
+            self._clock = clock
+
+        def complete(
+            self,
+            request: GroqTransportRequest,
+            request_pacer: GroqRequestPacer,
+        ) -> tuple[GroqTransportResponse, float]:
+            del request
+
+            def invoke() -> GroqTransportResponse:
+                self._clock.advance(2.0)
+                return response()
+
+            return request_pacer.pace_request(invoke)
+
+    clock = ManualClock(100.0)
+    provider = GroqModelProvider(
+        AdvancingTransport(clock),
+        live_configuration(),
+        pacer(clock),
+    )
+
+    first = provider.complete(request(ModelOperation.REPAIR_PLANNING))
+    second = provider.complete(request(ModelOperation.PATCH_GENERATION))
+
+    assert clock.sleeps == [59.0]
+    assert first.usage is not None and first.usage.latency_seconds == 2.0
+    assert second.usage is not None and second.usage.latency_seconds == 2.0
+    assert provider.snapshot_usage().model_latency_seconds == 4.0
+
+
+def test_shared_pacer_coordinates_separate_sdk_provider_instances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock(100.0)
+    shared_pacer = pacer(clock)
+    sdk_starts: list[float] = []
+
+    class Completions:
+        def create(self, **kwargs: object) -> object:
+            del kwargs
+            sdk_starts.append(clock())
+            return _chat_completion()
+
+    _install_fake_sdk(monkeypatch, Completions())
+    first_provider = GroqModelProvider(
+        SdkGroqTransport("credential", 45),
+        live_configuration(),
+        shared_pacer,
+    )
+    second_provider = GroqModelProvider(
+        SdkGroqTransport("credential", 45),
+        live_configuration(),
+        shared_pacer,
+    )
+
+    first_provider.complete(request(ModelOperation.REPAIR_PLANNING))
+    clock.advance(20.0)
+    second_provider.complete(
+        request(ModelOperation.PATCH_GENERATION).model_copy(
+            update={"case_id": "exception_handling"}
+        )
+    )
+
+    assert clock.sleeps == [41.0]
+    assert sdk_starts == [100.0, 161.0]
+
+
 def test_adapter_preserves_interrupt_and_rejects_invalid_measurement() -> None:
     class InterruptingTransport:
-        def complete(self, request: GroqTransportRequest) -> GroqTransportResponse:
+        def complete(
+            self,
+            request: GroqTransportRequest,
+            request_pacer: GroqRequestPacer,
+        ) -> tuple[GroqTransportResponse, float]:
             del request
-            raise KeyboardInterrupt
 
-    provider = GroqModelProvider(
-        InterruptingTransport(), live_configuration(), monotonic_clock=lambda: 1.0
-    )
+            def invoke() -> GroqTransportResponse:
+                raise KeyboardInterrupt
+
+            return request_pacer.pace_request(invoke)
+
+    provider = GroqModelProvider(InterruptingTransport(), live_configuration(), pacer())
     with pytest.raises(KeyboardInterrupt):
         provider.complete(request(ModelOperation.REPAIR_PLANNING))
 
     transport = RecordingTransport()
     backwards = iter((2.0, 1.0))
     provider = GroqModelProvider(
-        transport, live_configuration(), monotonic_clock=lambda: next(backwards)
+        transport,
+        live_configuration(),
+        GroqRequestPacer(monotonic_clock=lambda: next(backwards), sleeper=lambda delay: None),
     )
     with pytest.raises(LiveModelProviderError):
         provider.complete(request(ModelOperation.REPAIR_PLANNING))
@@ -213,6 +450,7 @@ def test_provider_factory_reads_credential_without_retaining_it() -> None:
         configuration,
         live_configuration(),
         environment(),
+        request_pacer=pacer(),
         transport_factory=factory,
     )
     assert captured == [(environment()["GROQ_API_KEY"], 120)]
@@ -225,6 +463,7 @@ def test_provider_factory_reads_credential_without_retaining_it() -> None:
             configuration,
             live_configuration(),
             missing,
+            request_pacer=pacer(),
             transport_factory=factory,
         )
     for invalid_credential in ("", "   "):
@@ -235,6 +474,7 @@ def test_provider_factory_reads_credential_without_retaining_it() -> None:
                 configuration,
                 live_configuration(),
                 invalid,
+                request_pacer=pacer(),
                 transport_factory=factory,
             )
 
@@ -338,7 +578,7 @@ def test_sdk_transport_uses_exact_chat_completions_request(
         _sdk_importer(Client),
     )
     transport = SdkGroqTransport("credential", 45)
-    response = transport.complete(transport_request())
+    response, latency_seconds = transport.complete(transport_request(), pacer())
     assert constructor_arguments == {
         "api_key": "credential",
         "base_url": "https://api.groq.com",
@@ -373,6 +613,171 @@ def test_sdk_transport_uses_exact_chat_completions_request(
     assert response.raw_json == '{"ok":true}'
     assert response.input_tokens == 7
     assert response.output_tokens == 2
+    assert latency_seconds == 0.0
+
+
+def test_sdk_transport_paces_actual_create_after_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock(100.0)
+    request_pacer = pacer(clock)
+    preparation_delays = iter((2.0, 0.0))
+    request_durations = iter((3.0, 4.0))
+    transport_entries: list[float] = []
+    sdk_starts: list[float] = []
+
+    class Completions:
+        def create(self, **kwargs: object) -> object:
+            del kwargs
+            sdk_starts.append(clock())
+            clock.advance(next(request_durations))
+            return _chat_completion()
+
+    class Client:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+            self._completions = Completions()
+
+        @property
+        def chat(self) -> object:
+            clock.advance(next(preparation_delays))
+            return SimpleNamespace(completions=self._completions)
+
+    monkeypatch.setattr(
+        "app.evaluation.live_model.importlib.import_module",
+        _sdk_importer(Client),
+    )
+    transport = SdkGroqTransport("credential", 45)
+
+    transport_entries.append(clock())
+    _, first_latency = transport.complete(transport_request(), request_pacer)
+    clock.advance(56.0)
+    transport_entries.append(clock())
+    _, second_latency = transport.complete(transport_request(), request_pacer)
+
+    assert transport_entries == [100.0, 161.0]
+    assert sdk_starts == [102.0, 163.0]
+    assert clock.sleeps == [2.0]
+    assert first_latency == 3.0
+    assert second_latency == 4.0
+
+
+def test_sdk_transport_does_not_sleep_after_interval_since_actual_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock(100.0)
+    request_pacer = pacer(clock)
+    sdk_starts: list[float] = []
+
+    class Completions:
+        def create(self, **kwargs: object) -> object:
+            del kwargs
+            sdk_starts.append(clock())
+            return _chat_completion()
+
+    _install_fake_sdk(monkeypatch, Completions())
+    transport = SdkGroqTransport("credential", 45)
+
+    transport.complete(transport_request(), request_pacer)
+    clock.advance(61.0)
+    transport.complete(transport_request(), request_pacer)
+
+    assert sdk_starts == [100.0, 161.0]
+    assert clock.sleeps == []
+
+
+def test_sdk_exception_releases_pacing_lock_and_preserves_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock(100.0)
+    request_pacer = pacer(clock)
+    sdk_starts: list[float] = []
+
+    class Completions:
+        def create(self, **kwargs: object) -> object:
+            del kwargs
+            sdk_starts.append(clock())
+            if len(sdk_starts) == 1:
+                raise RuntimeError("sensitive provider failure")
+            return _chat_completion()
+
+    _install_fake_sdk(monkeypatch, Completions())
+    transport = SdkGroqTransport("credential", 45)
+
+    with pytest.raises(LiveModelProviderError) as raised:
+        transport.complete(transport_request(), request_pacer)
+    response_value, _ = transport.complete(transport_request(), request_pacer)
+
+    assert "sensitive provider failure" not in str(raised.value)
+    assert response_value.status is GroqCompletionStatus.COMPLETED
+    assert sdk_starts == [100.0, 161.0]
+    assert clock.sleeps == [61.0]
+
+
+def test_concurrent_sdk_create_calls_cannot_bypass_shared_pacing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock(100.0)
+    request_pacer = pacer(clock)
+    first_create_started = Event()
+    both_prepared = Event()
+    release_first_create = Event()
+    preparation_lock = Lock()
+    prepared = 0
+    sdk_starts: list[float] = []
+    errors: list[BaseException] = []
+
+    class Completions:
+        def create(self, **kwargs: object) -> object:
+            del kwargs
+            sdk_starts.append(clock())
+            if len(sdk_starts) == 1:
+                first_create_started.set()
+                if not release_first_create.wait(timeout=5.0):
+                    raise RuntimeError("test synchronization failed")
+            return _chat_completion()
+
+    class Client:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+            self._completions = Completions()
+
+        @property
+        def chat(self) -> object:
+            nonlocal prepared
+            with preparation_lock:
+                prepared += 1
+                if prepared == 2:
+                    both_prepared.set()
+            return SimpleNamespace(completions=self._completions)
+
+    monkeypatch.setattr(
+        "app.evaluation.live_model.importlib.import_module",
+        _sdk_importer(Client),
+    )
+    transport = SdkGroqTransport("credential", 45)
+
+    def invoke() -> None:
+        try:
+            transport.complete(transport_request(), request_pacer)
+        except BaseException as error:
+            errors.append(error)
+
+    first = Thread(target=invoke)
+    second = Thread(target=invoke)
+    first.start()
+    assert first_create_started.wait(timeout=5.0)
+    second.start()
+    assert both_prepared.wait(timeout=5.0)
+    release_first_create.set()
+    first.join(timeout=5.0)
+    second.join(timeout=5.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert sdk_starts == [100.0, 161.0]
+    assert clock.sleeps == [61.0]
 
 
 @pytest.mark.parametrize(
@@ -445,7 +850,7 @@ def test_sdk_transport_maps_trustworthy_non_content_results_to_content_failure(
             return _chat_completion(choices=[choice])
 
     _install_fake_sdk(monkeypatch, Completions())
-    response = SdkGroqTransport("credential", 45).complete(transport_request())
+    response = sdk_complete(SdkGroqTransport("credential", 45))
     assert response.status is GroqCompletionStatus.CONTENT_FAILURE
     assert response.raw_json == "{}"
     assert response.input_tokens == 7
@@ -487,7 +892,7 @@ def test_sdk_transport_rejects_malformed_response_structures(
 
     _install_fake_sdk(monkeypatch, Completions())
     with pytest.raises(LiveModelProviderError, match="provider response"):
-        SdkGroqTransport("credential", 45).complete(transport_request())
+        sdk_complete(SdkGroqTransport("credential", 45))
 
 
 def _install_fake_sdk(monkeypatch: pytest.MonkeyPatch, completions: object) -> None:
@@ -557,7 +962,7 @@ def test_sdk_transport_maps_missing_dependency_and_provider_exception_safely(
     )
     transport = SdkGroqTransport("credential", 45)
     with pytest.raises(LiveModelProviderError, match="provider request failed") as failed:
-        transport.complete(transport_request())
+        sdk_complete(transport)
     assert "secret provider body" not in str(failed.value)
 
 
@@ -602,7 +1007,7 @@ def test_sdk_transport_rejects_malformed_usage(
 
     _install_fake_sdk(monkeypatch, Completions())
     with pytest.raises(LiveModelProviderError, match="provider usage"):
-        SdkGroqTransport("credential", 45).complete(transport_request())
+        sdk_complete(SdkGroqTransport("credential", 45))
 
 
 def test_sdk_transport_rejects_wrong_official_response_type(
@@ -615,7 +1020,7 @@ def test_sdk_transport_rejects_wrong_official_response_type(
 
     _install_fake_sdk(monkeypatch, Completions())
     with pytest.raises(LiveModelProviderError, match="provider response"):
-        SdkGroqTransport("credential", 45).complete(transport_request())
+        sdk_complete(SdkGroqTransport("credential", 45))
 
 
 @pytest.mark.parametrize(
@@ -638,5 +1043,5 @@ def test_sdk_transport_maps_provider_error_categories_safely(
 
     _install_fake_sdk(monkeypatch, Completions())
     with pytest.raises(LiveModelProviderError, match="provider request failed") as failed:
-        SdkGroqTransport("credential", 45).complete(transport_request())
+        sdk_complete(SdkGroqTransport("credential", 45))
     assert "secret body" not in str(failed.value)

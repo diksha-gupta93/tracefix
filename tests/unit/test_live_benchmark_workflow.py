@@ -6,6 +6,8 @@ from pathlib import Path
 
 def test_live_benchmark_workflow_is_manual_pinned_and_scopes_credential() -> None:
     workflow = Path(".github/workflows/live-benchmark.yml").read_text(encoding="utf-8")
+    assert "pacing" not in workflow.lower()
+    assert "rate_limit" not in workflow.lower()
     assert "workflow_dispatch:" in workflow
     assert "pull_request:" not in workflow
     assert "push:" not in workflow

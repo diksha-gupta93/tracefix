@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
 from importlib.metadata import distribution
@@ -11,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from app.agent.model import load_model_configuration
-from app.agent.schemas import PatchProposal, RepairPlan
+from app.agent.model import ModelProvider, load_model_configuration
+from app.agent.schemas import ModelConfiguration, PatchProposal, RepairPlan
 from app.artifacts import LocalArtifactWriter
 from app.cli import (
     ApplicationDependencies,
@@ -27,6 +28,7 @@ from app.cli import (
 from app.evaluation.benchmark import BenchmarkExecutionStatus, BenchmarkReport
 from app.evaluation.live_model import (
     GroqCompletionStatus,
+    GroqRequestPacer,
     GroqTransportRequest,
     GroqTransportResponse,
     LiveBenchmarkConfiguration,
@@ -148,25 +150,34 @@ def _environment(runtime_temp: Path) -> dict[str, str]:
     }
 
 
-class TickClock:
+class ManualPacingClock:
     def __init__(self) -> None:
-        self._value = 0.0
+        self.value = 0.0
+        self.sleeps: list[float] = []
 
     def __call__(self) -> float:
-        current = self._value
-        self._value += 0.1
-        return current
+        return self.value
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.value += seconds
 
 
 class ScriptedGroqTransport:
-    def __init__(self, requests: list[GroqTransportRequest], *, fail: bool = False) -> None:
+    def __init__(
+        self,
+        requests: list[GroqTransportRequest],
+        *,
+        fail_on_request_number: int | None = None,
+    ) -> None:
         self._requests = requests
-        self._fail = fail
+        self._fail_on_request_number = fail_on_request_number
 
-    def complete(self, request: GroqTransportRequest) -> GroqTransportResponse:
-        self._requests.append(request)
-        if self._fail:
-            raise RuntimeError("untrusted provider failure body")
+    def complete(
+        self,
+        request: GroqTransportRequest,
+        request_pacer: GroqRequestPacer,
+    ) -> tuple[GroqTransportResponse, float]:
         path = _FILES[request.case_id]
         if request.operation.value == "repair_planning":
             raw_json = RepairPlan(
@@ -187,12 +198,19 @@ class ScriptedGroqTransport:
                 risks=["preserve all other behavior"],
                 confidence=1.0,
             ).model_dump_json()
-        return GroqTransportResponse(
-            status=GroqCompletionStatus.COMPLETED,
-            raw_json=raw_json,
-            input_tokens=100,
-            output_tokens=50,
-        )
+
+        def invoke() -> GroqTransportResponse:
+            self._requests.append(request)
+            if len(self._requests) == self._fail_on_request_number:
+                raise RuntimeError("untrusted provider failure body")
+            return GroqTransportResponse(
+                status=GroqCompletionStatus.COMPLETED,
+                raw_json=raw_json,
+                input_tokens=100,
+                output_tokens=50,
+            )
+
+        return request_pacer.pace_request(invoke)
 
 
 def _application(
@@ -201,6 +219,8 @@ def _application(
     requests: list[GroqTransportRequest],
     *,
     fail_provider: bool = False,
+    fail_on_request_number: int | None = None,
+    pacing_clock: ManualPacingClock | None = None,
     stdout: StringIO | None = None,
     remove_environment: str | None = None,
 ) -> BenchmarkApplication:
@@ -210,6 +230,12 @@ def _application(
     output = StringIO() if stdout is None else stdout
     stderr = StringIO()
     repair_ids = iter(f"{index:032x}" for index in range(1, 10))
+    selected_pacing_clock = ManualPacingClock() if pacing_clock is None else pacing_clock
+    request_pacer = GroqRequestPacer(
+        monotonic_clock=selected_pacing_clock,
+        sleeper=selected_pacing_clock.sleep,
+    )
+    selected_failure = 1 if fail_provider else fail_on_request_number
     repair = RepairApplication(
         ApplicationDependencies(
             case_loader=load_trusted_case,
@@ -228,19 +254,18 @@ def _application(
     )
 
     def provider_factory(
-        configuration: object,
+        configuration: ModelConfiguration,
         live_configuration: LiveBenchmarkConfiguration,
-        source: object,
-    ):
-        assert isinstance(source, dict)
+        source: Mapping[str, str],
+    ) -> ModelProvider:
         return create_groq_model_provider(
-            configuration,  # type: ignore[arg-type]
+            configuration,
             live_configuration,
             source,
+            request_pacer=request_pacer,
             transport_factory=lambda credential, timeout: ScriptedGroqTransport(
-                requests, fail=fail_provider
+                requests, fail_on_request_number=selected_failure
             ),
-            monotonic_clock=TickClock(),
         )
 
     return BenchmarkApplication(
@@ -252,7 +277,7 @@ def _application(
             live_provider_factory=provider_factory,
             report_writer=LocalBenchmarkReportWriter(),
             clock=lambda: datetime.now(UTC),
-            run_id_factory=lambda: "b" * 32 if not fail_provider else "c" * 32,
+            run_id_factory=lambda: "b" * 32 if selected_failure is None else "c" * 32,
             invocation_directory=lambda: invocation,
             environment=environment,
             stdout=output,
@@ -271,7 +296,8 @@ def test_injected_live_transport_runs_all_cases_through_real_pipeline(tmp_path: 
     invocation.mkdir()
     runtime_temp.mkdir()
     requests: list[GroqTransportRequest] = []
-    application = _application(invocation, runtime_temp, requests)
+    pacing_clock = ManualPacingClock()
+    application = _application(invocation, runtime_temp, requests, pacing_clock=pacing_clock)
 
     entry_point = next(
         item
@@ -287,7 +313,11 @@ def test_injected_live_transport_runs_all_cases_through_real_pipeline(tmp_path: 
 
     assert result == 0
     assert len(requests) == 10
+    assert pacing_clock.sleeps == [61.0] * 9
     assert [request.case_id for request in requests[::2]] == list(_FILES)
+    assert [request.operation.value for request in requests] == [
+        operation for _ in _FILES for operation in ("repair_planning", "patch_generation")
+    ]
     report_path = invocation / ".tracefix" / "benchmarks" / ("b" * 32) / "report.json"
     report = BenchmarkReport.model_validate_json(
         report_path.read_text(encoding="utf-8"), strict=True
@@ -335,6 +365,44 @@ def test_provider_failure_publishes_partial_report_and_stops(tmp_path: Path) -> 
     ]
     assert "untrusted provider failure body" not in json.dumps(raw)
     assert not tuple(runtime_temp.glob("tracefix-run-*"))
+
+
+def test_provider_failure_after_pacing_preserves_fail_fast_behavior(tmp_path: Path) -> None:
+    invocation = (tmp_path / "invocation-paced-failure").resolve()
+    runtime_temp = (tmp_path / "runtime-paced-failure").resolve()
+    invocation.mkdir()
+    runtime_temp.mkdir()
+    requests: list[GroqTransportRequest] = []
+    pacing_clock = ManualPacingClock()
+    application = _application(
+        invocation,
+        runtime_temp,
+        requests,
+        fail_on_request_number=2,
+        pacing_clock=pacing_clock,
+    )
+
+    result = main(
+        ["benchmark", "--split", "development", "--provider", "groq"],
+        application_factory=_unused_repair_application,
+        benchmark_application_factory=lambda: application,
+    )
+
+    assert result == 6
+    assert len(requests) == 2
+    assert pacing_clock.sleeps == [61.0]
+    report_path = invocation / ".tracefix" / "benchmarks" / ("c" * 32) / "report.json"
+    raw = json.loads(report_path.read_text(encoding="utf-8"))
+    assert raw["counts"]["execution_failure"] == 1
+    assert raw["counts"]["not_run"] == 4
+    assert [item["classification"] for item in raw["cases"]] == [
+        "execution_failure",
+        "not_run",
+        "not_run",
+        "not_run",
+        "not_run",
+    ]
+    assert "untrusted provider failure body" not in json.dumps(raw)
 
 
 @pytest.mark.parametrize(

@@ -739,11 +739,26 @@ def default_application_factory() -> RepairApplication:
 def default_benchmark_application_factory() -> BenchmarkApplication:
     from app.agent.model import load_model_configuration
     from app.evaluation.live_model import (
+        GroqRequestPacer,
         create_groq_model_provider,
         load_live_benchmark_configuration,
     )
     from app.evaluation.reporting import LocalBenchmarkReportWriter
     from benchmarks.loader import load_development_cases
+
+    request_pacer = GroqRequestPacer()
+
+    def live_provider_factory(
+        configuration: ModelConfiguration,
+        live_configuration: LiveBenchmarkConfiguration,
+        environment: Mapping[str, str],
+    ) -> ModelProvider:
+        return create_groq_model_provider(
+            configuration,
+            live_configuration,
+            environment,
+            request_pacer=request_pacer,
+        )
 
     return BenchmarkApplication(
         BenchmarkApplicationDependencies(
@@ -751,7 +766,7 @@ def default_benchmark_application_factory() -> BenchmarkApplication:
             development_case_loader=load_development_cases,
             configuration_loader=load_model_configuration,
             live_configuration_loader=load_live_benchmark_configuration,
-            live_provider_factory=create_groq_model_provider,
+            live_provider_factory=live_provider_factory,
             report_writer=LocalBenchmarkReportWriter(),
             clock=_clock,
             run_id_factory=lambda: uuid.uuid4().hex,
