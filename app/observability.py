@@ -13,7 +13,7 @@ from langsmith.run_trees import RunTree
 from pydantic import ValidationError
 
 LANGSMITH_DIAGNOSTIC_PROJECT = "tracefix-live-diagnostics"
-LANGSMITH_API_ENDPOINT = "https://api.smith.langchain.com"
+LANGSMITH_API_ENDPOINT = "https://eu.api.smith.langchain.com"
 TRACEFIX_DIAGNOSTICS_ENVIRONMENT_VARIABLE = "TRACEFIX_LANGSMITH_DIAGNOSTICS"
 
 _AUTOMATIC_TRACING_ENVIRONMENT_VARIABLES = frozenset(
