@@ -5,6 +5,44 @@ import pytest
 from app.agent.patches import DiffLineKind, UnifiedDiffError, parse_unified_diff
 
 
+@pytest.mark.parametrize(
+    ("diff", "path", "old_path", "new_path"),
+    [
+        (
+            "--- a/src/example.py\n+++ b/src/example.py\n@@ -1,2 +1,2 @@\n keep\n-old\n+new\n",
+            "src/example.py",
+            "src/example.py",
+            "src/example.py",
+        ),
+        (
+            "--- /dev/null\n+++ b/src/added.py\n@@ -0,0 +1,2 @@\n+first\n+second\n",
+            "src/added.py",
+            None,
+            "src/added.py",
+        ),
+        (
+            "--- a/src/deleted.py\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-first\n-second\n",
+            "src/deleted.py",
+            "src/deleted.py",
+            None,
+        ),
+    ],
+    ids=("modification", "addition", "deletion"),
+)
+def test_parser_accepts_documented_file_header_contract(
+    diff: str,
+    path: str,
+    old_path: str | None,
+    new_path: str | None,
+) -> None:
+    parsed = parse_unified_diff(diff)
+
+    assert parsed.changed_paths == (path,)
+    assert parsed.files[0].old_path == old_path
+    assert parsed.files[0].new_path == new_path
+    assert parsed.has_ignored_content is False
+
+
 def test_parser_retains_immutable_hunk_coordinates_and_lines() -> None:
     parsed = parse_unified_diff(
         "--- a/src/example.py\n+++ b/src/example.py\n@@ -2,2 +2,3 @@\n keep\n-old\n+new\n+extra\n"
@@ -56,6 +94,51 @@ def test_parser_retains_no_final_newline_metadata() -> None:
     file = parsed.files[0]
     assert file.old_no_final_newline is True
     assert file.new_no_final_newline is True
+
+
+def test_parser_flags_markdown_fences_as_non_diff_content() -> None:
+    parsed = parse_unified_diff(
+        "```diff\n--- a/src/example.py\n+++ b/src/example.py\n@@ -1 +1 @@\n-old\n+new\n```\n"
+    )
+
+    assert parsed.has_ignored_content is True
+
+
+@pytest.mark.parametrize(
+    "diff",
+    [
+        "--- a/src/example.py\n@@ -1 +1 @@\n-old\n+new\n",
+        "--- src/example.py\n+++ b/src/example.py\n@@ -1 +1 @@\n-old\n+new\n",
+        "--- a/src/example.py\n+++ b/src/example.py\n@@ old new @@\n-old\n+new\n",
+        "--- a/src/example.py\n+++ b/src/example.py\n@@ -1,2 +1 @@\n-old\n+new\n",
+        "--- a/src/example.py\n+++ b/src/example.py\n@@ -1 +1 @@\n-old\n+new\n-outside\n",
+        "--- a/src/old.py\n+++ b/src/new.py\n@@ -1 +1 @@\n-old\n+new\n",
+        (
+            "--- a/src/example.py\n"
+            "+++ b/src/example.py\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+            "--- a/SRC/EXAMPLE.PY\n"
+            "+++ b/SRC/EXAMPLE.PY\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        ),
+    ],
+    ids=(
+        "missing-new-header",
+        "unsupported-prefix",
+        "malformed-hunk-header",
+        "hunk-count-mismatch",
+        "body-outside-hunk",
+        "path-mismatch",
+        "duplicate-file-identity",
+    ),
+)
+def test_parser_rejects_documented_invalid_diff_contract(diff: str) -> None:
+    with pytest.raises(UnifiedDiffError):
+        parse_unified_diff(diff)
 
 
 @pytest.mark.parametrize(

@@ -27,6 +27,7 @@ from app.agent.graph import (
     new_orchestration_state,
 )
 from app.agent.model import ModelDiagnosticError, ModelProvider
+from app.agent.patches import parse_unified_diff
 from app.agent.policy import PatchPolicy, PatchPolicyResult, validate_patch_policy
 from app.agent.routing import TerminalOutcome
 from app.agent.schemas import (
@@ -943,6 +944,18 @@ class MatrixScenarioProvider:
             raw_json = "[" * 20_000 + "0" + "]" * 20_000
         elif self._scenario == "patch_proposal_schema_invalid":
             raw_json = "{}"
+        elif self._scenario == "patch_proposal_unified_diff_invalid":
+            raw_json = (
+                _patch_proposal()
+                .model_copy(
+                    update={
+                        "unified_diff": (
+                            "--- a/src/pagination/pagination.py\n@@ -1 +1 @@\n-old\n+new\n"
+                        )
+                    }
+                )
+                .model_dump_json()
+            )
         else:
             raw_json = _patch_proposal().model_dump_json()
         return ModelProviderResponse(raw_json=raw_json)
@@ -955,6 +968,91 @@ class MatrixScenarioProvider:
             output_tokens=5 * calls,
             estimated_cost_usd=Decimal(0),
         )
+
+
+def _invoke_provider_contract_graph(
+    tmp_path: Path,
+    scenario: str,
+    tracer: GraphRecordingTracer,
+) -> tuple[OrchestrationState, list[str], MatrixScenarioProvider]:
+    calls: list[str] = []
+    boundaries = TransitionBoundaries(None, calls)
+    provider = MatrixScenarioProvider(scenario)
+    dependencies = GraphDependencies(
+        preparer=boundaries,
+        baseline=boundaries,
+        context_selector=boundaries,
+        static_validation=boundaries,
+        verification=boundaries,
+        workspace_integrity=LocalWorkspaceIntegrityBoundary(FingerprinterStub()),
+        clock=lambda: datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC),
+        model_configuration=_model_configuration(),
+        model_provider=provider,
+        classifier=boundaries.classify,
+        policy_validator=boundaries.policy,
+        evaluator=boundaries.evaluate,
+        tracer=tracer,
+    )
+    run_id = ("7" if scenario == "success" else "8") * 32
+    root = tmp_path / scenario
+    root.mkdir()
+    initial = new_orchestration_state(
+        run_id=run_id,
+        trusted_case=load_trusted_case("boundary_condition"),
+        workspaces=_workspaces(root, run_id),
+        started_at=datetime(2026, 1, 1, tzinfo=UTC),
+        model_configuration=_model_configuration(),
+    )
+    state = invoke_repair_graph(build_repair_graph(dependencies), initial)
+    return state, calls, provider
+
+
+def test_contract_compliant_provider_patch_reaches_policy_stage(tmp_path: Path) -> None:
+    proposal = PatchProposal.model_validate_json(_patch_proposal().model_dump_json(), strict=True)
+    assert parse_unified_diff(proposal.unified_diff).changed_paths == tuple(proposal.files_changed)
+    tracer = GraphRecordingTracer()
+
+    result, calls, provider = _invoke_provider_contract_graph(tmp_path, "success", tracer)
+
+    assert result.terminal_route is not None
+    assert result.terminal_route.outcome is TerminalOutcome.SUCCESS
+    assert [request.operation.value for request in provider.requests] == [
+        "repair_planning",
+        "patch_generation",
+    ]
+    assert "validate_patch_policy" in calls
+    envelope = next(
+        record for record in tracer.records if record["name"] == "validate_patch_envelope"
+    )
+    assert envelope["metadata"] == {
+        "unified_diff_result": "passed",
+        "path_agreement_result": "passed",
+        "changed_file_count": 1,
+        "patch_envelope_result": "passed",
+    }
+
+
+def test_malformed_provider_diff_stops_before_policy_with_safe_diagnostic(
+    tmp_path: Path,
+) -> None:
+    tracer = GraphRecordingTracer()
+
+    result, calls, provider = _invoke_provider_contract_graph(
+        tmp_path, "patch_proposal_unified_diff_invalid", tracer
+    )
+
+    assert result.terminal_route is not None
+    assert result.terminal_route.outcome is TerminalOutcome.MALFORMED_MODEL_OUTPUT
+    assert len(provider.requests) == 2
+    assert "validate_patch_policy" not in calls
+    envelope = next(
+        record for record in tracer.records if record["name"] == "validate_patch_envelope"
+    )
+    assert envelope["metadata"] == {
+        "patch_envelope_result": "failed",
+        "unified_diff_result": "failed",
+        "terminal_diagnostic_code": "unified_diff_parsing_failure",
+    }
 
 
 class MatrixGraphRepairApplication:

@@ -13,6 +13,31 @@ _HUNK_HEADER = re.compile(
 _BINARY_MARKER = re.compile(r"^(?:GIT binary patch|Binary files [^\r\n]+ differ)$")
 _MAX_HUNK_NUMBER_DIGITS = 18
 
+UNIFIED_DIFF_GENERATION_CONTRACT = "\n".join(
+    (
+        "PatchProposal.unified_diff contract:",
+        "- Use raw unified-diff text only: emit only paired headers, hunks, and permitted "
+        "no-newline markers; no NUL, Markdown fences, explanatory prose, shell commands, XML "
+        "wrappers, or JSON wrappers inside the field.",
+        "- Use normalized repository-relative POSIX paths (no absolute paths, drives, "
+        "backslashes, empty, '.' or '..' segments, surrounding whitespace, controls, or "
+        "case-fold aliases).",
+        "- Modified files use paired headers `--- a/<path>` and `+++ b/<path>` (a/ and b/ "
+        "prefixes); added files use `--- /dev/null` and `+++ b/<path>`; deleted files use "
+        "`--- a/<path>` and `+++ /dev/null`. Non-null paired paths must be identical, and each "
+        "file identity must be unique.",
+        "- Every file pair must have at least one hunk with header "
+        "`@@ -<old_start>,<old_count> +<new_start>,<new_count> @@`. A count of 1 may omit "
+        "`,1`; a start may be 0 only when its count is 0.",
+        "- Every hunk body line must start with exactly one prefix character: space for context, "
+        "- for removed, or + for added. Old/new line totals must exactly match the header counts.",
+        r"- `\ No newline at end of file` may appear only immediately after the affected hunk "
+        "body line and must not repeat for the same old/new side.",
+        "- `files_changed` must exactly equal the diff paths and the repair plan's "
+        "`files_expected_to_change`.",
+    )
+)
+
 
 class DiffLineKind(StrEnum):
     CONTEXT = "context"
