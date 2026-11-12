@@ -59,6 +59,12 @@ from app.evaluation.deterministic.candidate import (
     CandidateModelUsage,
     evaluate_candidate,
 )
+from app.observability import (
+    NOOP_TRACER,
+    DiagnosticTracer,
+    automatic_langsmith_tracing_disabled,
+    safe_metadata,
+)
 from benchmarks.loader import TrustedCase
 
 if TYPE_CHECKING:
@@ -461,6 +467,7 @@ class GraphDependencies:
     patch_generator: PatchGenerator = generate_patch
     policy_validator: PolicyValidator = validate_patch_policy
     evaluator: CandidateEvaluator = evaluate_candidate
+    tracer: DiagnosticTracer = NOOP_TRACER
 
 
 def _strict_state(candidate: object) -> OrchestrationState:
@@ -734,7 +741,15 @@ class _GraphNodes:
                 raise ValueError
             if state.model_configuration != configuration:
                 raise ValueError
-            plan = self._dependencies.planner(state.context, configuration, provider)
+            if self._dependencies.planner is plan_repair:
+                plan = plan_repair(
+                    state.context,
+                    configuration,
+                    provider,
+                    tracer=self._dependencies.tracer,
+                )
+            else:
+                plan = self._dependencies.planner(state.context, configuration, provider)
             plan = RepairPlan.model_validate(plan.model_dump(warnings="none"), strict=True)
             legacy = record_repair_plan(state.legacy_state, state.context, plan, configuration)
             legacy.updated_at = _utc(self._dependencies.clock())
@@ -774,9 +789,18 @@ class _GraphNodes:
                 or provider is None
             ):
                 raise ValueError
-            proposal = self._dependencies.patch_generator(
-                state.context, state.repair_plan, configuration, provider
-            )
+            if self._dependencies.patch_generator is generate_patch:
+                proposal = generate_patch(
+                    state.context,
+                    state.repair_plan,
+                    configuration,
+                    provider,
+                    tracer=self._dependencies.tracer,
+                )
+            else:
+                proposal = self._dependencies.patch_generator(
+                    state.context, state.repair_plan, configuration, provider
+                )
             proposal = PatchProposal.model_validate(
                 proposal.model_dump(warnings="none"), strict=True
             )
@@ -1012,6 +1036,78 @@ def _after_verification(
     return "route_result" if state.failure_override is not None else "evaluate_candidate"
 
 
+_TRACE_NODE_NAMES: dict[NodeName, str] = {
+    "prepare_repository": "prepare_repository",
+    "run_baseline": "run_baseline",
+    "classify_failure": "classify_failure",
+    "select_relevant_context": "build_context",
+    "plan_repair": "plan_repair",
+    "generate_patch": "generate_patch",
+    "validate_patch_policy": "patch_policy",
+    "run_static_checks": "static_checks",
+    "verify_in_sandbox": "verification",
+    "evaluate_candidate": "evaluation",
+    "route_result": "evaluation",
+}
+
+
+def _trace_node_result(
+    node: NodeName,
+    result: object,
+    tracer: DiagnosticTracer,
+) -> None:
+    try:
+        if type(result) is not dict or set(result) != {"state"}:
+            return
+        state = _strict_state(result["state"])
+        metadata = safe_metadata(execution_status="completed")
+        if state.failure_override is not None:
+            metadata.update(safe_metadata(terminal_diagnostic_code=state.failure_override.value))
+        if node == "validate_patch_policy" and state.policy_result is not None:
+            metadata.update(
+                safe_metadata(policy_result="passed" if state.policy_result.approved else "failed")
+            )
+        elif node == "run_static_checks" and state.static_result is not None:
+            metadata.update(safe_metadata(static_check_result=state.static_result.outcome.value))
+        elif node == "verify_in_sandbox" and state.verification_result is not None:
+            metadata.update(
+                safe_metadata(verification_result=state.verification_result.outcome.value)
+            )
+        elif node == "evaluate_candidate" and state.evaluation_result is not None:
+            metadata.update(
+                safe_metadata(evaluation_result=state.evaluation_result.functional_status.value)
+            )
+        tracer.add_metadata(metadata)
+    except Exception:
+        return
+
+
+def _traced_action(
+    node: NodeName,
+    action: Callable[[GraphTransport], object],
+    tracer: DiagnosticTracer,
+) -> Callable[[GraphTransport], object]:
+    if node == "route_result" or not tracer.enabled:
+        return action
+
+    def invoke(transport: GraphTransport) -> object:
+        try:
+            state = _transport(transport)
+            metadata = safe_metadata(
+                case_id=state.case_id,
+                node_name=node,
+                stage_name=_TRACE_NODE_NAMES[node],
+            )
+        except Exception:
+            return action(transport)
+        with tracer.span(_TRACE_NODE_NAMES[node], metadata):
+            result = action(transport)
+            _trace_node_result(node, result, tracer)
+            return result
+
+    return invoke
+
+
 def build_repair_graph(
     dependencies: GraphDependencies,
 ) -> CompiledStateGraph[GraphTransport, None, GraphTransport, GraphTransport]:
@@ -1031,7 +1127,8 @@ def build_repair_graph(
         ("route_result", nodes.route_result),
     )
     for name, action in actions:
-        graph.add_node(name, cast("StateNode[GraphTransport, None]", action))
+        traced = _traced_action(name, action, dependencies.tracer)
+        graph.add_node(name, cast("StateNode[GraphTransport, None]", traced))
     graph.add_edge(START, "prepare_repository")
     graph.add_conditional_edges("prepare_repository", _after_prepare)
     graph.add_conditional_edges("run_baseline", _after_baseline)
@@ -1051,7 +1148,8 @@ def invoke_repair_graph(
     graph: CompiledStateGraph[GraphTransport, None, GraphTransport, GraphTransport],
     initial_state: OrchestrationState,
 ) -> OrchestrationState:
-    result: object = graph.invoke({"state": _strict_state(initial_state)})
+    with automatic_langsmith_tracing_disabled():
+        result: object = graph.invoke({"state": _strict_state(initial_state)})
     if type(result) is not dict:
         raise ValueError("graph returned an invalid transport")
     return _strict_state(result.get("state"))

@@ -24,6 +24,15 @@ from benchmarks.loader import load_development_cases
 START = datetime(2026, 11, 3, 10, 0, tzinfo=UTC)
 
 
+def test_observability_does_not_change_benchmark_report_schema() -> None:
+    assert not {
+        "trace_id",
+        "spans",
+        "langsmith_project",
+        "terminal_diagnostic_code",
+    }.intersection(BenchmarkReport.model_fields)
+
+
 def live_configuration() -> LiveBenchmarkConfiguration:
     return LiveBenchmarkConfiguration(
         request_timeout_seconds=120,

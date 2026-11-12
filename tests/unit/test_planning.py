@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import traceback
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
@@ -45,6 +47,7 @@ from app.agent.schemas import (
 )
 from app.agent.schemas import TestResult as SchemaTestResult
 from app.agent.schemas import TestStatus as SchemaTestStatus
+from app.observability import NOOP_TRACER, DiagnosticSpan, SafeMetadata, safe_metadata
 from app.sandbox import SandboxCompletion
 
 
@@ -74,6 +77,56 @@ class WrongEnvelopeProvider:
     def complete(self, request: ModelProviderRequest) -> ModelProviderResponse:
         del request
         return object()  # type: ignore[return-value]
+
+
+class RecordingSpan:
+    def __init__(self, record: dict[str, object]) -> None:
+        self._record = record
+
+    def add_metadata(self, metadata: SafeMetadata) -> None:
+        checked = safe_metadata(metadata)
+        recorded = self._record["metadata"]
+        assert isinstance(recorded, dict)
+        recorded.update(checked)
+
+
+class RecordingTracer:
+    def __init__(self) -> None:
+        self.records: list[dict[str, object]] = []
+        self._stack: list[str] = []
+
+    @property
+    def enabled(self) -> bool:
+        return True
+
+    @contextmanager
+    def span(self, name: str, metadata: SafeMetadata | None = None) -> Iterator[DiagnosticSpan]:
+        record: dict[str, object] = {
+            "name": name,
+            "parent": None if not self._stack else self._stack[-1],
+            "metadata": safe_metadata(metadata),
+        }
+        self.records.append(record)
+        self._stack.append(name)
+        try:
+            yield RecordingSpan(record)
+        finally:
+            self._stack.pop()
+
+    def add_metadata(self, metadata: SafeMetadata) -> None:
+        if not self._stack:
+            return
+        for record in reversed(self.records):
+            if record["name"] == self._stack[-1]:
+                RecordingSpan(record).add_metadata(metadata)
+                return
+
+
+def _metadata_for(tracer: RecordingTracer, name: str) -> Mapping[str, object]:
+    record = next(item for item in tracer.records if item["name"] == name)
+    metadata = record["metadata"]
+    assert isinstance(metadata, dict)
+    return metadata
 
 
 def configuration() -> ModelConfiguration:
@@ -799,6 +852,220 @@ def test_diff_content_that_resembles_headers_remains_valid_in_a_hunk() -> None:
     proposal = generate_patch(context_package(), repair_plan(), configuration(), provider)
 
     assert proposal.unified_diff == diff.rstrip()
+
+
+def test_fake_tracing_builds_safe_planning_generation_hierarchy_without_content() -> None:
+    sentinel = "SENTINEL_SECRET_SOURCE_PROMPT_MODEL_DIFF"
+    plan_values = repair_plan().model_dump()
+    plan_values["suspected_root_cause"] = sentinel
+    traced_plan = RepairPlan.model_validate(plan_values, strict=True)
+    proposal_values = patch_proposal().model_dump()
+    proposal_values["summary"] = sentinel
+    proposal_values["unified_diff"] = proposal_values["unified_diff"].replace(
+        "+    return value <= 2", f"+    return value <= 2  # {sentinel}"
+    )
+    traced_proposal = PatchProposal.model_validate(proposal_values, strict=True)
+    provider = QueueProvider(response(traced_plan), response(traced_proposal))
+    tracer = RecordingTracer()
+
+    with (
+        tracer.span("tracefix.live_benchmark"),
+        tracer.span("case.boundary_condition"),
+    ):
+        plan = plan_repair(
+            context_package(injected=sentinel), configuration(), provider, tracer=tracer
+        )
+        proposal = generate_patch(
+            context_package(injected=sentinel),
+            plan,
+            configuration(),
+            provider,
+            tracer=tracer,
+        )
+
+    assert plan == traced_plan
+    assert proposal == traced_proposal
+    assert [(item["name"], item["parent"]) for item in tracer.records] == [
+        ("tracefix.live_benchmark", None),
+        ("case.boundary_condition", "tracefix.live_benchmark"),
+        ("provider_request", "case.boundary_condition"),
+        ("parse_repair_plan", "case.boundary_condition"),
+        ("validate_repair_plan", "case.boundary_condition"),
+        ("provider_request", "case.boundary_condition"),
+        ("parse_patch_proposal", "case.boundary_condition"),
+        ("validate_patch_proposal", "case.boundary_condition"),
+        ("validate_patch_envelope", "case.boundary_condition"),
+    ]
+    rendered = json.dumps(tracer.records, sort_keys=True)
+    assert sentinel not in rendered
+    assert "rendered_prompt" not in rendered
+    assert "raw_json" not in rendered
+    assert '"unified_diff":' not in rendered
+
+
+def test_invalid_json_and_repair_plan_schema_failure_are_distinguishable() -> None:
+    invalid_json_tracer = RecordingTracer()
+    with pytest.raises(ModelDiagnosticError):
+        plan_repair(
+            context_package(),
+            configuration(),
+            QueueProvider(ModelProviderResponse(raw_json="not-json")),
+            tracer=invalid_json_tracer,
+        )
+    schema_tracer = RecordingTracer()
+    with pytest.raises(ModelDiagnosticError):
+        plan_repair(
+            context_package(),
+            configuration(),
+            QueueProvider(ModelProviderResponse(raw_json="{}")),
+            tracer=schema_tracer,
+        )
+
+    assert (
+        _metadata_for(invalid_json_tracer, "parse_repair_plan")["terminal_diagnostic_code"]
+        == "invalid_json"
+    )
+    assert "validate_repair_plan" not in {item["name"] for item in invalid_json_tracer.records}
+    assert (
+        _metadata_for(schema_tracer, "validate_repair_plan")["terminal_diagnostic_code"]
+        == "repair_plan_schema_validation_failure"
+    )
+
+
+def test_patch_schema_validation_is_safe_and_distinct_from_repair_plan_validation() -> None:
+    sentinel = "SENTINEL_RAW_VALIDATION_INPUT"
+    values = patch_proposal().model_dump()
+    values["confidence"] = sentinel
+    tracer = RecordingTracer()
+
+    with pytest.raises(ModelDiagnosticError):
+        generate_patch(
+            context_package(),
+            repair_plan(),
+            configuration(),
+            QueueProvider(ModelProviderResponse(raw_json=json.dumps(values))),
+            tracer=tracer,
+        )
+
+    metadata = _metadata_for(tracer, "validate_patch_proposal")
+    assert metadata["terminal_diagnostic_code"] == ("patch_proposal_schema_validation_failure")
+    assert metadata["validation_field_path"] == "$.confidence"
+    assert metadata["validation_error_type"] == "value_error"
+    assert sentinel not in json.dumps(tracer.records, sort_keys=True)
+
+
+@pytest.mark.parametrize(
+    ("proposal", "diagnostic_code", "result_key"),
+    [
+        (
+            patch_proposal(files=["src/other.py"]),
+            "path_disagreement",
+            "path_agreement_result",
+        ),
+        (
+            patch_proposal(diff="not a unified diff"),
+            "unified_diff_parsing_failure",
+            "unified_diff_result",
+        ),
+        (
+            patch_proposal(files=["../escape.py"]),
+            "invalid_patch_envelope",
+            "patch_envelope_result",
+        ),
+    ],
+)
+def test_patch_envelope_failure_boundaries_remain_distinguishable(
+    proposal: PatchProposal,
+    diagnostic_code: str,
+    result_key: str,
+) -> None:
+    tracer = RecordingTracer()
+
+    with pytest.raises(ModelDiagnosticError):
+        generate_patch(
+            context_package(),
+            repair_plan(),
+            configuration(),
+            QueueProvider(response(proposal)),
+            tracer=tracer,
+        )
+
+    metadata = _metadata_for(tracer, "validate_patch_envelope")
+    assert metadata["terminal_diagnostic_code"] == diagnostic_code
+    assert metadata[result_key] == "failed"
+
+
+def test_enabled_fake_tracing_does_not_change_planning_or_generation_outputs() -> None:
+    expected_plan = repair_plan()
+    expected_proposal = patch_proposal()
+    untraced_provider = QueueProvider(response(expected_plan), response(expected_proposal))
+    traced_provider = QueueProvider(response(expected_plan), response(expected_proposal))
+
+    untraced_plan = plan_repair(context_package(), configuration(), untraced_provider)
+    untraced_proposal = generate_patch(
+        context_package(), untraced_plan, configuration(), untraced_provider
+    )
+    tracer = RecordingTracer()
+    traced_plan = plan_repair(context_package(), configuration(), traced_provider, tracer=tracer)
+    traced_proposal = generate_patch(
+        context_package(), traced_plan, configuration(), traced_provider, tracer=tracer
+    )
+
+    assert (traced_plan, traced_proposal) == (untraced_plan, untraced_proposal)
+    assert traced_provider.requests == untraced_provider.requests
+
+
+def _planning_result(raw_json: str, tracer: RecordingTracer | None = None) -> object:
+    try:
+        return plan_repair(
+            context_package(),
+            configuration(),
+            QueueProvider(ModelProviderResponse(raw_json=raw_json)),
+            tracer=tracer if tracer is not None else NOOP_TRACER,
+        )
+    except ModelDiagnosticError as error:
+        return (error.diagnostic.stage, error.diagnostic.code)
+
+
+def _generation_result(raw_json: str, tracer: RecordingTracer | None = None) -> object:
+    try:
+        return generate_patch(
+            context_package(),
+            repair_plan(),
+            configuration(),
+            QueueProvider(ModelProviderResponse(raw_json=raw_json)),
+            tracer=tracer if tracer is not None else NOOP_TRACER,
+        )
+    except ModelDiagnosticError as error:
+        return (error.diagnostic.stage, error.diagnostic.code)
+
+
+@pytest.mark.parametrize(
+    "raw_json",
+    [
+        "not-json",
+        "{}",
+        repair_plan().model_dump_json(),
+        "[" * 20_000 + "0" + "]" * 20_000,
+    ],
+    ids=("malformed", "invalid-schema", "valid", "deeply-nested"),
+)
+def test_repair_plan_parser_has_exact_traced_untraced_semantic_parity(raw_json: str) -> None:
+    assert _planning_result(raw_json, RecordingTracer()) == _planning_result(raw_json)
+
+
+@pytest.mark.parametrize(
+    "raw_json",
+    [
+        "not-json",
+        "{}",
+        patch_proposal().model_dump_json(),
+        "[" * 20_000 + "0" + "]" * 20_000,
+    ],
+    ids=("malformed", "invalid-schema", "valid", "deeply-nested"),
+)
+def test_patch_proposal_parser_has_exact_traced_untraced_semantic_parity(raw_json: str) -> None:
+    assert _generation_result(raw_json, RecordingTracer()) == _generation_result(raw_json)
 
 
 def test_successful_state_updates_are_copy_on_update_and_record_identity() -> None:

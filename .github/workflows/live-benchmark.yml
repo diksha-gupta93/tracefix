@@ -87,6 +87,12 @@ jobs:
           BENCHMARK_SPLIT: ${{ inputs.split }}
           BENCHMARK_PROVIDER: ${{ inputs.provider }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TRACEFIX_LANGSMITH_DIAGNOSTICS: "true"
+          LANGSMITH_TRACING: "false"
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          LANGSMITH_PROJECT: tracefix-live-diagnostics
+          LANGSMITH_HIDE_INPUTS: "true"
+          LANGSMITH_HIDE_OUTPUTS: "true"
         run: |
           set +e
           tracefix benchmark --split "${BENCHMARK_SPLIT}" --provider "${BENCHMARK_PROVIDER}"

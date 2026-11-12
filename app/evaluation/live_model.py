@@ -32,6 +32,7 @@ from app.agent.schemas import (
     RepairPlan,
 )
 from app.evaluation.deterministic.candidate import CandidateModelUsage
+from app.observability import NOOP_TRACER, DiagnosticTracer, safe_metadata
 
 GROQ_PROVIDER_NAME = "groq"
 GROQ_MODEL_NAME = "openai/gpt-oss-120b"
@@ -478,12 +479,14 @@ class GroqModelProvider(ModelProvider):
         transport: GroqTransport,
         configuration: LiveBenchmarkConfiguration,
         request_pacer: GroqRequestPacer,
+        tracer: DiagnosticTracer = NOOP_TRACER,
     ) -> None:
         self._transport = transport
         self._configuration = LiveBenchmarkConfiguration.model_validate(
             configuration.model_dump(warnings="none"), strict=True
         )
         self._request_pacer = request_pacer
+        self._tracer = tracer
         self._latency = 0.0
         self._input_tokens = 0
         self._output_tokens = 0
@@ -513,6 +516,17 @@ class GroqModelProvider(ModelProvider):
             checked_response = GroqTransportResponse.model_validate(
                 response.model_dump(warnings="none"), strict=True
             )
+            if self._tracer.enabled:
+                self._tracer.add_metadata(
+                    safe_metadata(
+                        finish_category=checked_response.status.value,
+                        terminal_diagnostic_code=(
+                            "provider_content_failure"
+                            if checked_response.status is GroqCompletionStatus.CONTENT_FAILURE
+                            else "provider_response_completed"
+                        ),
+                    )
+                )
             usage = ModelCallUsage(
                 latency_seconds=latency_seconds,
                 input_tokens=checked_response.input_tokens,
@@ -560,6 +574,7 @@ def create_groq_model_provider(
     *,
     request_pacer: GroqRequestPacer,
     transport_factory: TransportFactory = SdkGroqTransport,
+    tracer: DiagnosticTracer = NOOP_TRACER,
 ) -> GroqModelProvider:
     try:
         checked = ModelConfiguration.model_validate(
@@ -580,7 +595,7 @@ def create_groq_model_provider(
         ):
             raise ValueError
         transport = transport_factory(credential, live_checked.request_timeout_seconds)
-        return GroqModelProvider(transport, live_checked, request_pacer)
+        return GroqModelProvider(transport, live_checked, request_pacer, tracer)
     except (KeyboardInterrupt, SystemExit):
         raise
     except LiveModelProviderError:

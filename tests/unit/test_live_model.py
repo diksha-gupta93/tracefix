@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from decimal import Decimal, localcontext
 from threading import Event, Lock, Thread
 from types import SimpleNamespace
@@ -24,6 +26,7 @@ from app.evaluation.live_model import (
     create_groq_model_provider,
     load_live_benchmark_configuration,
 )
+from app.observability import DiagnosticSpan, SafeMetadata, safe_metadata
 
 
 def environment() -> dict[str, str]:
@@ -78,6 +81,24 @@ class RecordingTransport:
             return self.responses.pop(0)
 
         return request_pacer.pace_request(invoke)
+
+
+class MetadataRecorder:
+    def __init__(self) -> None:
+        self.values: list[dict[str, object]] = []
+
+    @property
+    def enabled(self) -> bool:
+        return True
+
+    @contextmanager
+    def span(self, name: str, metadata: SafeMetadata | None = None) -> Iterator[DiagnosticSpan]:
+        del name
+        self.add_metadata(safe_metadata(metadata))
+        yield self  # type: ignore[misc]
+
+    def add_metadata(self, metadata: SafeMetadata) -> None:
+        self.values.append(safe_metadata(metadata))
 
 
 class ManualClock:
@@ -335,6 +356,29 @@ def test_adapter_maps_request_measures_usage_and_calculates_exact_cost() -> None
     assert usage.estimated_cost_usd == Decimal("0.0000123")
     rendered = first.model_dump_json() + second.model_dump_json() + usage.model_dump_json()
     assert environment()["GROQ_API_KEY"] not in rendered
+
+
+def test_adapter_emits_safe_provider_finish_category_without_content() -> None:
+    recorder = MetadataRecorder()
+    provider = GroqModelProvider(
+        RecordingTransport(),
+        live_configuration(),
+        pacer(),
+        recorder,
+    )
+
+    provider.complete(request(ModelOperation.REPAIR_PLANNING))
+    provider.complete(request(ModelOperation.PATCH_GENERATION))
+
+    assert recorder.values[0] == {
+        "finish_category": "completed",
+        "terminal_diagnostic_code": "provider_response_completed",
+    }
+    assert recorder.values[1] == {
+        "finish_category": "content_failure",
+        "terminal_diagnostic_code": "provider_content_failure",
+    }
+    assert all("raw_json" not in values for values in recorder.values)
 
 
 def test_pacing_delay_is_excluded_from_provider_latency() -> None:

@@ -16,6 +16,20 @@ def test_live_benchmark_workflow_is_manual_pinned_and_scopes_credential() -> Non
     assert "GROQ_API_KEY" not in workflow[:paid_step]
     paid_block = workflow[paid_step : workflow.index("- name: Upload safe benchmark evidence")]
     assert "GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}" in paid_block
+    assert "LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}" in paid_block
+    assert 'TRACEFIX_LANGSMITH_DIAGNOSTICS: "true"' in paid_block
+    assert 'LANGSMITH_TRACING: "false"' in paid_block
+    assert 'LANGSMITH_TRACING: "true"' not in workflow
+    assert "LANGSMITH_ENDPOINT" not in workflow
+    assert "LANGCHAIN_ENDPOINT" not in workflow
+    assert "LANGSMITH_TRACING_MODE" not in workflow
+    assert "LANGCHAIN_TRACING_MODE" not in workflow
+    assert "OTEL_EXPORTER_OTLP_ENDPOINT" not in workflow
+    assert "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" not in workflow
+    assert "LANGSMITH_PROJECT: tracefix-live-diagnostics" in paid_block
+    assert 'LANGSMITH_HIDE_INPUTS: "true"' in paid_block
+    assert 'LANGSMITH_HIDE_OUTPUTS: "true"' in paid_block
+    assert "LANGSMITH_API_KEY" not in workflow[:paid_step]
     assert "OPENAI_API_KEY" not in workflow
     assert '--provider "${BENCHMARK_PROVIDER}"' in paid_block
     assert "- groq" in workflow

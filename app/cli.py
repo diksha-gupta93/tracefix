@@ -10,13 +10,15 @@ import tempfile
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol, TextIO
 
 from pydantic import ValidationError
+
+from app.observability import NOOP_TRACER, DiagnosticTracer, safe_metadata
 
 if TYPE_CHECKING:
     from app.agent.graph import Clock, GraphDependencies, OrchestrationState, RunWorkspaces
@@ -450,6 +452,8 @@ class RepairApplication:
         case: TrustedCase,
         configuration: ModelConfiguration | None,
         provider: ModelProvider | None,
+        *,
+        tracer: DiagnosticTracer = NOOP_TRACER,
     ) -> RepairRunExecution:
         from app.agent.graph import (
             build_repair_graph,
@@ -492,6 +496,7 @@ class RepairApplication:
                 graph_dependencies = dependencies.graph_dependencies_factory(
                     configuration, provider, dependencies.clock
                 )
+                graph_dependencies = replace(graph_dependencies, tracer=tracer)
                 state = invoke_repair_graph(build_repair_graph(graph_dependencies), initial)
             except (KeyboardInterrupt, SystemExit):
                 raise
@@ -557,6 +562,7 @@ class BenchmarkApplicationDependencies:
     environment: Mapping[str, str]
     stdout: TextIO
     stderr: TextIO
+    tracer: DiagnosticTracer = NOOP_TRACER
 
 
 class BenchmarkApplication:
@@ -631,73 +637,150 @@ class BenchmarkApplication:
             return 6
 
         providers: list[ModelProvider] = [first_provider]
-
-        def execute_case(case: TrustedCase) -> BenchmarkCaseExecution:
-            model_provider = (
-                providers.pop()
-                if providers
-                else dependencies.live_provider_factory(
-                    configuration, live_configuration, dependencies.environment
-                )
-            )
-            execution = dependencies.repair_application.execute_trusted_case(
-                case, configuration, model_provider
-            )
-            route = execution.state.terminal_route
-            if route is None:
-                raise RepairExecutionError("repair run did not terminate")
-            return BenchmarkCaseExecution(
-                case_id=execution.state.case_id,
-                terminal_outcome=route.outcome,
-                model_usage=execution.state.model_usage,
-                artifact_path=execution.artifact_path,
-            )
-
-        try:
-            case_results = run_benchmark_cases(cases, execute_case)
-            completed_at = dependencies.clock()
-            report = build_benchmark_report(
+        with dependencies.tracer.span(
+            "tracefix.live_benchmark",
+            safe_metadata(
                 benchmark_run_id=benchmark_run_id,
-                model=configuration.model_name,
+                provider_name=configuration.provider,
+                model_name=configuration.model_name,
                 prompt_version=configuration.prompt_version,
-                started_at=started_at,
-                completed_at=completed_at,
-                live_configuration=live_configuration,
-                cases=case_results,
-            )
-            invocation_value = dependencies.invocation_directory()
-            if not isinstance(invocation_value, Path):
-                raise ValueError
-            publication = dependencies.report_writer.write(report, invocation_value.absolute())
-            if type(publication) is not BenchmarkReportPublication:
-                raise ValueError
-            checked_publication = BenchmarkReportPublication.model_validate(
-                publication.model_dump(warnings="none"), strict=True
-            )
-            exit_code = 0 if report.execution_status is BenchmarkExecutionStatus.COMPLETED else 6
-            summary = BenchmarkSummary(
-                report=report,
-                exit_code=exit_code,
-                publication=checked_publication,
-            )
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except Exception:
-            self._safe_error("tracefix: benchmark execution failed safely\n")
-            return 6
-        try:
-            dependencies.stdout.write(f"{summary.render()}\n")
-            dependencies.stdout.flush()
-        except (KeyboardInterrupt, SystemExit):
-            with suppress(Exception):
-                dependencies.report_writer.discard(checked_publication, invocation_value.absolute())
-            raise
-        except Exception:
-            with suppress(Exception):
-                dependencies.report_writer.discard(checked_publication, invocation_value.absolute())
-            self._safe_error("tracefix: benchmark console output failed\n")
-            return 6
-        return exit_code
+            ),
+        ) as benchmark_span:
+
+            def execute_case(case: TrustedCase) -> BenchmarkCaseExecution:
+                with dependencies.tracer.span(
+                    f"case.{case.manifest.case_id}",
+                    safe_metadata(
+                        benchmark_run_id=benchmark_run_id,
+                        case_id=case.manifest.case_id,
+                        provider_name=configuration.provider,
+                        model_name=configuration.model_name,
+                        prompt_version=configuration.prompt_version,
+                        attempt_number=1,
+                    ),
+                ) as case_span:
+                    try:
+                        model_provider = (
+                            providers.pop()
+                            if providers
+                            else dependencies.live_provider_factory(
+                                configuration, live_configuration, dependencies.environment
+                            )
+                        )
+                        execution = dependencies.repair_application.execute_trusted_case(
+                            case,
+                            configuration,
+                            model_provider,
+                            tracer=dependencies.tracer,
+                        )
+                        route = execution.state.terminal_route
+                        if route is None:
+                            raise RepairExecutionError("repair run did not terminate")
+                        classification = (
+                            "repair_success"
+                            if route.outcome.value == "success"
+                            else (
+                                "execution_failure"
+                                if route.outcome.value
+                                in {
+                                    "infrastructure_failure",
+                                    "baseline_not_reproducible",
+                                }
+                                else "repair_failure"
+                            )
+                        )
+                        case_span.add_metadata(
+                            safe_metadata(
+                                terminal_repair_status=route.outcome.value,
+                                terminal_diagnostic_code=(
+                                    route.outcome.value
+                                    if route.diagnostic is None
+                                    else route.diagnostic.code.value
+                                ),
+                                benchmark_classification=classification,
+                            )
+                        )
+                        return BenchmarkCaseExecution(
+                            case_id=execution.state.case_id,
+                            terminal_outcome=route.outcome,
+                            model_usage=execution.state.model_usage,
+                            artifact_path=execution.artifact_path,
+                        )
+                    except (KeyboardInterrupt, SystemExit):
+                        case_span.add_metadata(
+                            safe_metadata(terminal_diagnostic_code="interrupted")
+                        )
+                        raise
+                    except Exception:
+                        case_span.add_metadata(
+                            safe_metadata(
+                                terminal_diagnostic_code="execution_failure",
+                                benchmark_classification="execution_failure",
+                            )
+                        )
+                        raise
+
+            try:
+                case_results = run_benchmark_cases(cases, execute_case)
+                completed_at = dependencies.clock()
+                report = build_benchmark_report(
+                    benchmark_run_id=benchmark_run_id,
+                    model=configuration.model_name,
+                    prompt_version=configuration.prompt_version,
+                    started_at=started_at,
+                    completed_at=completed_at,
+                    live_configuration=live_configuration,
+                    cases=case_results,
+                )
+                invocation_value = dependencies.invocation_directory()
+                if not isinstance(invocation_value, Path):
+                    raise ValueError
+                publication = dependencies.report_writer.write(report, invocation_value.absolute())
+                if type(publication) is not BenchmarkReportPublication:
+                    raise ValueError
+                checked_publication = BenchmarkReportPublication.model_validate(
+                    publication.model_dump(warnings="none"), strict=True
+                )
+                exit_code = (
+                    0 if report.execution_status is BenchmarkExecutionStatus.COMPLETED else 6
+                )
+                summary = BenchmarkSummary(
+                    report=report,
+                    exit_code=exit_code,
+                    publication=checked_publication,
+                )
+                benchmark_span.add_metadata(
+                    safe_metadata(execution_status=report.execution_status.value)
+                )
+            except (KeyboardInterrupt, SystemExit):
+                benchmark_span.add_metadata(safe_metadata(terminal_diagnostic_code="interrupted"))
+                raise
+            except Exception:
+                benchmark_span.add_metadata(
+                    safe_metadata(
+                        execution_status="failed",
+                        terminal_diagnostic_code="benchmark_execution_failure",
+                    )
+                )
+                self._safe_error("tracefix: benchmark execution failed safely\n")
+                return 6
+            try:
+                dependencies.stdout.write(f"{summary.render()}\n")
+                dependencies.stdout.flush()
+            except (KeyboardInterrupt, SystemExit):
+                with suppress(Exception):
+                    dependencies.report_writer.discard(
+                        checked_publication, invocation_value.absolute()
+                    )
+                raise
+            except Exception:
+                with suppress(Exception):
+                    dependencies.report_writer.discard(
+                        checked_publication, invocation_value.absolute()
+                    )
+                self._safe_error("tracefix: benchmark console output failed\n")
+                return 6
+            return exit_code
 
     def _safe_error(self, message: str) -> None:
         with suppress(Exception):
@@ -744,8 +827,10 @@ def default_benchmark_application_factory() -> BenchmarkApplication:
         load_live_benchmark_configuration,
     )
     from app.evaluation.reporting import LocalBenchmarkReportWriter
+    from app.observability import create_diagnostic_tracer
     from benchmarks.loader import load_development_cases
 
+    tracer = create_diagnostic_tracer(os.environ)
     request_pacer = GroqRequestPacer()
 
     def live_provider_factory(
@@ -758,6 +843,7 @@ def default_benchmark_application_factory() -> BenchmarkApplication:
             live_configuration,
             environment,
             request_pacer=request_pacer,
+            tracer=tracer,
         )
 
     return BenchmarkApplication(
@@ -774,6 +860,7 @@ def default_benchmark_application_factory() -> BenchmarkApplication:
             environment=os.environ,
             stdout=sys.stdout,
             stderr=sys.stderr,
+            tracer=tracer,
         )
     )
 
