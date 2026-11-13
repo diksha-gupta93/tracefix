@@ -1,10 +1,26 @@
 # TraceFix
 
-TraceFix v0.1 is a local, single-attempt repair and evaluation pipeline for five seeded Python
-benchmark repositories. It reproduces each failure, asks either a deterministic fake provider or
-the explicitly selected Groq profile for a typed repair plan and patch, rejects unsafe proposals,
-and verifies candidates in hardened Docker containers. It is an evaluation project, not a
-production repair service, and it does not claim reliable repair of arbitrary repositories.
+![Python](https://img.shields.io/badge/Python-3.14-blue)
+![Docker](https://img.shields.io/badge/Docker-Sandboxed-blue)
+![Tests](https://img.shields.io/badge/Tests-1260%20Passed-brightgreen)
+![Status](https://img.shields.io/badge/Status-v0.1%20Development-orange)
+
+TraceFix v0.1 is a local, single-attempt repair and evaluation pipeline for five seeded Python benchmark repositories. It reproduces each failure, asks either a deterministic fake provider or the explicitly selected Groq profile for a typed repair plan and patch, rejects unsafe proposals, and verifies candidates in hardened Docker containers. 
+
+TraceFix v0.1 focuses on local repair evaluation, sandboxed execution, and reproducible benchmark evidence.
+
+## v0.1 Snapshot
+
+| Capability | Current status |
+| --- | --- |
+| Benchmark cases | 5 seeded Python defects |
+| Deterministic fake provider | 5/5 end-to-end |
+| Live Groq benchmark | 1/5 successful repair |
+| Docker sandbox | Implemented |
+| Static validation | Compile, AST, Ruff, mypy, Bandit |
+| LangSmith diagnostics | Metadata-only |
+| Repair attempts | 1 per case |
+| Execution model | Local, synchronous pipeline |
 
 ## Architecture
 
