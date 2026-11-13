@@ -1,186 +1,61 @@
 # TraceFix
 
-TraceFix is an in-progress autonomous code-repair and evaluation platform for failing Python
-repositories. Its current foundation prepares deterministic benchmark snapshots, fingerprints their
-contents, reproduces known failures inside a hardened Docker sandbox, classifies captured
-pytest/Python evidence deterministically, and selects bounded model-safe context through static
-text and AST inspection. It can now pass that context through a typed, dependency-injected model
-boundary to produce a strictly validated repair plan and structurally validated inert patch
-proposal for the single v0.1 attempt. A deterministic typed patch-policy gate now rejects
-out-of-scope or unsafe proposals before a deterministic static-validation gate applies an approved
-patch to a fresh candidate and runs compilation, AST parsing, Ruff, strict mypy, and Bandit in a
-dedicated hardened container. Passing candidates are now verified in fixed increasing scope inside
-the hardened pytest sandbox and evaluated with deterministic functional, patch-size, execution-
-duration, and optional supplied model-usage metrics. A synchronous eleven-node LangGraph now
-routes one repair attempt to a deterministic local outcome, and the installed CLI publishes a
-safe metadata-only run artifact.
-
-A static pass remains blocking prerequisite evidence only; functional success requires targeted,
-full-visible, and hidden verification to pass.
-
-## Current Status
-
-The repository has completed the v0.1 foundation through Task 0.1.10b:
-
-- Python 3.14 packaging, CI, and deterministic quality tooling
-- strict Pydantic v2 schemas for repair state, results, plans, patches, and evaluations
-- five deterministic seeded benchmark cases with trusted evaluator-only material
-- hardened Docker execution with CPU, memory, PID, time, and output limits
-- network isolation, non-root execution, a read-only root filesystem, capability dropping, and
-  `no-new-privileges`
-- repository preparation with path validation, isolated workspaces, and deterministic content
-  fingerprinting
-- baseline reproduction of each seeded visible failure in the Docker sandbox
-- typed handling of reproduced failures, unexpected passes, timeouts, OOM termination, sandbox
-  failures, malformed results, and cleanup failures
-- deterministic runtime failure classification with ambiguity and truncation handled fail-closed
-- immutable, exact-byte-bounded context packages containing relevant visible tests, tracebacks,
-  traceback-referenced source and static definitions/imports/types
-- evaluator, secret-bearing, generated, binary, invalid UTF-8, aliased, stale, and unrelated
-  context exclusion with immutable protected-path metadata
-- strict frozen configuration for the five model and prompt environment variables, with no
-  defaults or credential handling
-- a typed dependency-injected model-provider protocol with one production-composed deterministic
-  fake provider and no live adapter, SDK, external model network call, streaming, tool call, or
-  retry behavior
-- deterministic versioned planning and generation prompts that delimit the exact bounded context
-  as untrusted data and request schema-only JSON
-- strict `RepairPlan` and `PatchProposal` parsing, bounded provider output, safe typed diagnostics,
-  normalized path identities, and minimal unified-diff envelope validation
-- copy-on-update single-attempt state transitions through `plan_complete` and `patch_proposed`, with
-  provider/model/prompt identity recording
-- pure, deterministic patch-policy validation with fixed limits of three changed files and 200
-  added-plus-removed hunk lines
-- aggregated, deduplicated, stably ordered typed violations for protected paths, binary or secret
-  content, test/assertion manipulation, CI/security changes, direct process execution,
-  dependencies, and evaluator/benchmark/reference material
-- distinct fail-closed typed diagnostics for malformed policy, proposal, path, and diff input
-- exact, atomic UTF-8 text patch application for modifications, additions, and deletions, with no
-  offset search, fuzz, path stripping, Git invocation, or partial publication
-- byte-level changed-file validation before and after static tooling, preserving the prepared
-  snapshot and publishing only a fully passing candidate
-- fixed-order compilation, AST, Ruff, strict-mypy, and Bandit checks in the dedicated
-  `tracefix-static-checks:0.1.8` image, with candidate configuration and suppressions disabled or
-  rejected
-- strict safe results that distinguish deterministic candidate findings from Docker, tool,
-  protocol, filesystem-integrity, and cleanup diagnostics
-- adversarial filesystem and sandbox security tests, including Linux TOCTOU regression coverage
-- fixed-order candidate verification against targeted, complete-visible, and trusted hidden tests
-- private hidden-only evaluator bundles mounted read-only and removed after every outcome
-- safe verification evidence that discards raw test and Docker output and distinguishes functional
-  failure from timeout, OOM, integrity, Docker, protocol, evaluator, and cleanup diagnostics
-- deterministic candidate evaluation with ordered changed files, added/removed line counts,
-  executed sandbox duration, and nullable exact model latency/token/Decimal-USD values
-- an in-memory, single-attempt LangGraph with eleven named nodes, explicit terminal short circuits,
-  no retry edge, and seven fixed terminal outcomes
-- `tracefix repair <case_id>` with preflight case validation, stable exit codes, graph-owned private
-  workspaces, deterministic safe artifacts, and a production registry that registers and resolves
-  only the `tracefix-fake` provider
-
-[`docs/progress.md`](docs/progress.md) is the source of truth for task completion and recorded
-validation evidence. Task 0.1.11c provides the explicitly invoked Groq live-model benchmark while
-ordinary CI remains deterministic and credential-free.
-
-## Why TraceFix
-
-Generating a diff is only one part of automated repair. A credible repair system also needs to
-reproduce the original failure, control untrusted execution, preserve evidence, distinguish repair
-failures from infrastructure failures, and evaluate changes without leaking hidden answers.
-
-TraceFix is being built around those constraints:
-
-- reproducible snapshots and versioned content fingerprints;
-- typed boundaries instead of implicit dictionaries between components;
-- deterministic fixtures separated from future stochastic model evaluation;
-- fail-closed path validation and isolated execution;
-- explicit completion and failure classification;
-- adversarial tests for security-sensitive filesystem behavior; and
-- specification-driven tasks with formatting, linting, typing, and test gates.
+TraceFix v0.1 is a local, single-attempt repair and evaluation pipeline for five seeded Python
+benchmark repositories. It reproduces each failure, asks either a deterministic fake provider or
+the explicitly selected Groq profile for a typed repair plan and patch, rejects unsafe proposals,
+and verifies candidates in hardened Docker containers. It is an evaluation project, not a
+production repair service, and it does not claim reliable repair of arbitrary repositories.
 
 ## Architecture
 
-The intended local repair flow is:
+The current pipeline is synchronous and in memory:
 
-```text
-benchmark case
-  -> repository preparation and fingerprinting       [implemented]
-  -> baseline failure reproduction                    [implemented]
-  -> failure classification and relevant context      [implemented]
-  -> repair planning and patch generation             [implemented]
-  -> patch policy                                      [implemented]
-  -> patch application and static validation           [implemented]
-  -> sandbox verification                              [implemented]
-  -> deterministic candidate evaluation                [implemented]
-  -> routing and local artifacts                        [implemented]
+```mermaid
+flowchart LR
+    A[Repository preparation] --> B[Baseline reproduction]
+    B --> C[Failure classification]
+    C --> D[Context selection]
+    D --> E[Repair planning]
+    E --> F[Patch generation]
+    F --> G[Structured validation]
+    G --> H[Unified-diff validation]
+    H --> I[Plan / proposal / diff path agreement]
+    I --> J[Patch policy]
+    J --> K[Static checks]
+    K --> L[Docker sandbox verification]
+    L --> M[Candidate evaluation]
+    M --> N[Run artifact / benchmark reports]
 ```
 
-The current implementation stops after one routed local attempt. Model access remains behind an
-injected protocol, with one production-composed deterministic local fake provider and no live
-provider. Policy approval and static validation are necessary but not sufficient: a candidate is
-successful only when targeted, full-visible, and hidden verification all pass. The graph has no
-checkpointer, persistence, retry, or resume behavior. The live-provider benchmark reuses this same
-single-attempt graph. v0.2 adds persistence, queue-backed workers, API ingress, and checkpoint recovery; v1.0
-adds GitHub integration, human approval, and production observability. External systems are
-designed to sit behind typed adapters, and long-running work will run in workers rather than HTTP
-handlers once those layers exist.
+The eleven-node LangGraph combines the model-output validation steps within its planning and patch
+generation nodes. Patch policy runs before a proposal is applied. Static validation applies an
+approved patch to a fresh candidate and runs Python compilation, AST parsing, Ruff, strict mypy,
+and Bandit in the `tracefix-static-checks:0.1.8` image. Functional verification then runs targeted,
+complete-visible, and hidden tests in that order in the `tracefix-sandbox:0.1.3a` image. A static
+pass alone is not a successful repair.
+
+External systems are reached through typed adapters. Model prompts, responses, patches, test
+output, hidden-test material, credentials, raw exceptions, and absolute host paths are excluded
+from published artifacts and controlled diagnostics.
 
 See the [system architecture](docs/architecture/tracefix-system-architecture.md) for the target
-component model, trust boundaries, and versioned evolution.
+component model and trust boundaries.
 
-## Current Capabilities
+## Requirements
 
-TraceFix can currently:
+- CPython `>=3.14,<3.15`; the repository and CI currently use Python 3.14.
+- `pip` and the repository's `.venv` virtual environment.
+- Docker with a usable Linux-container daemon and built-in seccomp support.
 
-- load trusted and model-safe views of five validated benchmark manifests;
-- keep hidden tests and reference patches outside prepared repositories and baseline commands;
-- materialize a declared failing snapshot into a fresh caller-owned workspace;
-- reject unsafe paths, links/reparse points, unsupported entries, source mutation, destination
-  escape, and protected or aliased locations;
-- calculate a location-independent, versioned SHA-256 repository fingerprint;
-- execute only validated `python -m pytest` commands for declared visible test paths;
-- retain bounded stdout, stderr, truncation flags, exit status, duration, and completion evidence;
-  classify recognized syntax, import, assertion, exception, type, timeout, and environment
-  evidence without using benchmark answers;
-- produce deterministic context under an exact 32,768-byte default limit while revalidating the
-  prepared fingerprint and evaluator boundary;
-- load strict model configuration from exactly five named environment variables and construct
-  deterministic `repair-v1.0` requests through an injected typed provider; and
-- resolve the explicitly configured `tracefix-fake` provider to immutable, predetermined plan and
-  patch responses for all five development cases without credentials or model-provider network
-  access;
-- produce a canonical repair plan and inert patch proposal with exact plan/proposal/diff path-set
-  agreement for attempt `1`; and
-- inspect a proposal entirely in memory against immutable protected and forbidden paths, the fixed
-  v0.1 size limits, high-confidence local content signatures, an empty-by-default dependency
-  allowlist, and evaluator isolation rules, returning only safe typed metadata;
-- apply an approved modification/addition/deletion diff with exact coordinates, contexts, removed
-  lines, UTF-8 and LF/CRLF semantics in a fresh private candidate copy;
-- prove the actual added/modified/deleted byte set equals both the proposal and parsed diff before
-  and after analysis; and
-- run all surviving changed `.py` and `.pyi` files through Python 3.14 compilation and AST parsing,
-  isolated Ruff, strict mypy, and Bandit in a fixed-command hardened container;
-- verify candidates in targeted, full-visible, then hidden order with deterministic
-  short-circuiting and identity/fingerprint checks before, between, and after execution;
-- copy only declared hidden-test bytes into deterministic private names, mount the bundle
-  read-only, discard raw output, and clean up the bundle while leaving the candidate untouched; and
-- purely evaluate functional outcome, changed paths, added/removed lines, executed sandbox
-  duration, and optional supplied model latency, token counts, and exact USD cost. Missing
-  measurements remain `null`, while zero remains a valid observation.
+Docker is required to reproduce benchmark failures, run candidate static checks, verify candidates,
+and execute the Docker integration/security suite. Ordinary source inspection and the Ruff, mypy,
+and unit-test commands do not themselves start containers. Docker Desktop using Linux containers is
+supported for Windows development, but Linux is the supported host for complete adversarial
+filesystem guarantees.
 
-Current benchmark revisions are symbolic snapshot identities, not Git commit SHAs. Successful
-prepared workspaces are caller-owned and must be cleaned up after downstream work completes.
+## Installation and quick start
 
-TraceFix now provides one explicit Groq live-model adapter and development benchmark command. It
-does not provide an API, persistent jobs, queue, GitHub repair integration, retries, provider/model
-comparisons, or production observability.
-
-## Quick Start
-
-Prerequisites are CPython 3.14, `pip`, and Docker with a usable Linux-container daemon and built-in
-seccomp support. Docker Desktop with Linux containers is supported for Windows development, subject
-to the host limitation described under [Security Model](#security-model).
-
-From the repository root in Windows PowerShell:
+From the repository root in Windows PowerShell, with Python 3.14 selected:
 
 ```powershell
 python -m venv .venv
@@ -188,189 +63,30 @@ python -m venv .venv
 python -m pip install --editable ".[dev]"
 docker build --tag tracefix-sandbox:0.1.3a --file docker/sandbox/Dockerfile .
 docker build --tag tracefix-static-checks:0.1.8 --file docker/static-checks/Dockerfile .
-python scripts/check.py
+python -B scripts/check.py
 ```
 
-On POSIX systems, activate the environment with `. .venv/bin/activate`; the remaining commands are
-the same. After setup, use the existing `.venv` rather than creating another runtime environment.
+On POSIX systems, activate with `. .venv/bin/activate`; the remaining commands are the same. Reuse
+the existing `.venv` after setup.
 
-## Local Repair Command
+## Deterministic fake-model execution
 
-The installed public command is exactly:
+The deterministic `tracefix-fake` provider is the normal safe way to validate the complete pipeline
+locally and in CI. It has fixed project-owned responses for the five development cases, needs no
+model credential, makes no provider network request, and produces repeatable repair evidence.
 
-```text
-tracefix repair <case_id>
+In PowerShell, run one case through the installed CLI:
+
+```powershell
+$env:MODEL_PROVIDER = "tracefix-fake"
+$env:MODEL_NAME = "tracefix-deterministic-v1"
+$env:MODEL_TEMPERATURE = "0"
+$env:MODEL_MAX_TOKENS = "4096"
+$env:PROMPT_VERSION = "repair-v1.0"
+tracefix repair boundary_condition
 ```
 
-The command validates malformed and unknown case IDs before creating a workspace, loading model
-configuration, invoking Docker, or writing an artifact. To run any of the five development cases
-through the local deterministic provider and the complete eleven-node pipeline, set exactly:
-
-```text
-MODEL_PROVIDER=tracefix-fake
-MODEL_NAME=tracefix-deterministic-v1
-MODEL_TEMPERATURE=0
-MODEL_MAX_TOKENS=4096
-PROMPT_VERSION=repair-v1.0
-```
-
-The fake provider accepts no alternate profile. It uses explicit project-owned responses keyed by
-case ID, prompt version, and attempt number; it does not parse prompts, read benchmark/evaluator
-files at runtime, require model credentials, or make provider network calls. An unknown provider or
-unsupported fake profile follows the existing safe `infrastructure_failure` route. This repair
-command remains independent from the explicitly configured live benchmark described below.
-
-For identical valid requests, fake response bytes are stable. Across complete runs, the terminal
-route, exit code, changed-file and line-count evidence, stage outcomes, and provider/model/prompt
-identity are stable. Run IDs, timestamps, measured durations, temporary paths, and artifact
-filenames are intentionally volatile and are validated for shape and internal consistency instead
-of byte equality.
-
-Completed known-case runs print one summary and write
-`.tracefix/artifacts/<case_id>-<run_id>.json` relative to the invocation directory. The versioned
-artifact contains only safe structured metadata: identities and UTC timestamps, the terminal route,
-baseline completion metadata, failure category, policy/static metadata, safe verification evidence,
-and candidate evaluation metrics when available. It explicitly excludes source/context content,
-model prompts and raw responses, proposal prose and diff, stdout/stderr, raw Docker/tool output,
-hidden-test names or content, reference material, exception text, environment values, credentials,
-secrets, and absolute paths. Publication is exclusive and atomic; an existing destination is never
-overwritten.
-
-Each run owns one private temporary root with separate preparation, candidate, and verification
-areas. The trees remain available through routing and artifact projection, then the complete owned
-root is removed on success, every terminal failure, and interruption. Cleanup uncertainty changes
-the result to `infrastructure_failure`.
-
-| Exit code | Outcome |
-| ---: | --- |
-| 0 | `success` |
-| 1 | `candidate_failure` |
-| 2 | CLI syntax/input error, including an unknown case |
-| 3 | `policy_violation` |
-| 4 | `static_check_failure` |
-| 5 | `baseline_not_reproducible` |
-| 6 | `infrastructure_failure`, cleanup failure, or artifact-publication failure |
-| 7 | `malformed_model_output` |
-
-`KeyboardInterrupt` retains the conventional process exit code `130` after best-effort cleanup.
-
-## Live-Model Benchmark
-
-Live-model benchmarking is separate from deterministic CI and must be invoked explicitly. Install
-the optional live dependency and configure the single approved v0.1 profile:
-
-```text
-python -m pip install --editable ".[dev,live]"
-MODEL_PROVIDER=groq
-MODEL_NAME=openai/gpt-oss-120b
-MODEL_TEMPERATURE=0
-MODEL_REASONING_EFFORT=low
-MODEL_MAX_TOKENS=4096
-PROMPT_VERSION=repair-v1.0
-MODEL_REQUEST_TIMEOUT_SECONDS=120
-MODEL_INPUT_PRICE_USD_PER_MILLION_TOKENS=<reviewed current rate>
-MODEL_OUTPUT_PRICE_USD_PER_MILLION_TOKENS=<reviewed current rate>
-GROQ_API_KEY=<credential>
-tracefix benchmark --split development --provider groq
-```
-
-The command accepts exactly the `development` split and `groq` provider, then runs all five cases
-sequentially through the same one-attempt graph, policy, static checks, hardened sandbox,
-verification, evaluation, artifact publication, and cleanup used by `tracefix repair`. The
-credential is read only by the provider factory and is never added to model configuration, graph
-state, containers, artifacts, reports, diagnostics, or console output.
-
-Each invocation publishes canonical JSON and equivalent Markdown beneath
-`.tracefix/benchmarks/<benchmark_run_id>/report.json` and `report.md`, with ordered case outcomes,
-latency, provider-reported tokens, exact operator-rate-based estimated USD cost, counts, success
-rate, and aggregates. Estimated cost is not a provider invoice. Valid `candidate_failure`,
-`policy_violation`, `static_check_failure`, and `malformed_model_output` results are benchmark
-evidence, so a run containing only repair successes/failures exits `0`. Provider, platform,
-baseline, cleanup, artifact, or report-publication failure stops later paid work, marks remaining
-cases `not_run` when a partial report can be published, and exits `6`. Interruption exits `130`.
-
-The manual **Live benchmark** GitHub Actions workflow installs `.[dev,live]`, runs deterministic
-validation, builds both fixed images, performs the explicitly authorized paid run, and uploads only
-the safe report pair and metadata-only per-case artifacts. It is triggered only by
-`workflow_dispatch`; it is not a required push or pull-request check.
-
-Current limitations are one explicitly configured Groq model, five development cases, one attempt,
-no retries, no schedules, no provider/model comparisons, no confidence intervals, no persistence,
-and no production observability.
-
-## Validation
-
-The canonical local and CI validation entry point is:
-
-```text
-python scripts/check.py
-```
-
-It runs Ruff formatting checks, Ruff linting, strict mypy checks, and pytest. The pytest suite
-includes the applicable Docker integration and adversarial security tests. Local Docker tests skip
-only when the Docker CLI or a usable Linux-container daemon is unavailable; CI builds both fixed
-images first and executes the integration suite. A reachable daemon without seccomp support, or a
-missing required image when Docker is usable, is a failure.
-
-Recorded milestone results belong in [`docs/progress.md`](docs/progress.md), not in manually
-duplicated README counters.
-
-## Security Model
-
-Untrusted benchmark code is never executed directly on the host. Each run uses a fresh Linux
-container with the prepared repository mounted read-only. The container has no network, runs as
-numeric UID/GID `10001:10001`, drops all capabilities, enables `no-new-privileges`, retains Docker's
-default seccomp profile, and uses a read-only root filesystem with only explicit temporary writable
-mounts. Host secrets, credentials, proxy configuration, Docker configuration, the Docker socket, and
-developer home directories are not exposed. Resource and returned-output limits are typed and
-bounded, and containers are forcibly terminated on timeout and removed after every outcome.
-
-Candidate verification likewise never executes candidate or test code on the host. Visible stages
-mount only the validated candidate. The hidden stage creates a fresh bundle containing only the
-loader-declared hidden-test bytes under TraceFix-owned names and mounts it read-only at a fixed
-path; it never mounts the evaluator directory, manifest, reference patch, benchmark root, project
-root, home directory, credentials, or Docker socket. Candidate identity and content fingerprints
-are checked around execution. Raw visible/hidden output, Docker output, exception text, and paths
-do not cross the verification adapter. Timeout, OOM, integrity, Docker, protocol, evaluator, and
-cleanup failures remain infrastructure diagnostics rather than functional repair failures.
-
-Static validation never compiles or analyzes candidate Python on the host. Host code only copies,
-hashes, compares, and transforms inert bytes in a fresh contained staging tree. The dedicated
-static image receives a read-only candidate mount and normalized changed Python paths only, copies
-the candidate into tmpfs, and invokes fixed tool argument sequences with no shell. Candidate Ruff,
-mypy, and Bandit configuration, plugins, caches, baselines, inline Ruff/Bandit suppressions, and
-mypy suppression directives cannot change the gate. Raw tool output and source text are discarded;
-cross-module findings retain only bounded normalized path, location, and rule metadata.
-
-Repository context, repair plans, provider responses, and generated diffs are untrusted data. Model
-responses are byte-bounded before strict JSON parsing, diagnostics do not expose prompts, context,
-raw responses, exception text, credentials, or host paths, and generated diffs remain inert. Patch
-policy revalidates the proposal and policy, normalizes paths and line endings, reports every safely
-detectable violation without retaining matched content, and uses no filesystem, environment,
-network, process, Docker, or candidate-execution capability. The model boundary receives no
-filesystem, command, Docker, credential, or network capability.
-
-Graph routing revalidates every typed handoff and binds policy, static validation, verification, and
-evaluation to the generated proposal identity. Baseline non-reproduction bypasses the model and all
-candidate nodes; policy rejection bypasses patch application; static failure bypasses verification;
-all well-formed verification outcomes are evaluated before routing. Artifacts serialize an explicit
-allowlist rather than the graph state. Workspace cleanup validates the exact recorded owner identity
-before recursively removing only the run-owned temporary root.
-
-Linux is the production-supported host for adversarial repository preparation and execution.
-Windows is development-supported, but native Windows does not claim complete host-side TOCTOU
-protection during repository preparation. Running Linux containers through Docker Desktop does not
-remove that Windows host preparation limitation.
-
-The Docker daemon, project-owned sandbox image, host administrator, and container engine remain
-trusted. The detailed assumptions, protected-path behavior, and future hardening boundaries are
-documented in the [system architecture](docs/architecture/tracefix-system-architecture.md) and the
-[sandbox hardening specification](docs/specs/0.1-003c-security-hardening.md).
-
-## Benchmark / Evaluation Approach
-
-The development benchmark contains five small, deterministic Python defects, all of which can now
-run end to end through `tracefix repair <case_id>` with the configured fake provider:
+Valid case IDs are:
 
 - `boundary_condition`
 - `exception_handling`
@@ -378,47 +94,155 @@ run end to end through `tracefix repair <case_id>` with the configured fake prov
 - `incorrect_conditional`
 - `incorrect_return_value`
 
-Each case contains a failing repository snapshot, visible test metadata, hidden regression tests,
-and a reference patch. Trusted loaders may access evaluator material; model-safe views and prepared
-repositories may not. The current integration suite verifies that all five declared visible
-failures reproduce inside the real sandbox while fixture sources remain unchanged.
+The Docker-backed integration test runs all five cases through the installed command and real
+pipeline:
 
-This is deterministic platform and integration testing: it answers whether preparation,
-classification, model-boundary handling, patch enforcement, isolation, verification, evaluation,
-artifact publication, and cleanup behave correctly. It does not measure or claim live-model repair
-capability. Candidate evaluation reparses the inert diff for deterministic files and added/removed
-counts, sums only executed verification-stage duration, and receives trusted aggregate live usage
-when the live benchmark reaches evaluation. The versioned benchmark report remains the canonical
-complete usage and exact operator-rate-based cost record, including earlier valid model-repair
-failures. No model-performance result is claimed here; measured results exist only in reports from
-human-authorized runs.
+```text
+python -m pytest tests/integration/test_fake_model_cli.py
+```
 
-## Repository Structure
+Each completed repair command writes a metadata-only artifact relative to the invocation directory:
 
-- [`app/`](app/) — typed agent state, model boundary, planning, repository preparation, baseline
-  execution, and Docker adapter
-- [`benchmarks/`](benchmarks/) — deterministic development fixtures and trusted/model-safe loaders
-- [`tests/`](tests/) — unit, Docker integration, filesystem, and adversarial security tests
-- [`docs/architecture/`](docs/architecture/) — target architecture and security boundaries
-- [`docs/specs/`](docs/specs/) — one implementation contract per completed task
-- [`docs/plan/`](docs/plan/) — versioned execution roadmap
-- [`scripts/check.py`](scripts/check.py) — canonical validation entry point
+```text
+.tracefix/artifacts/<case_id>-<run_id>.json
+```
 
-## Roadmap
+Exit codes are `0` for success, `1` for candidate failure, `2` for CLI input errors, `3` for patch
+policy rejection, `4` for static-check failure, `5` when the baseline is not reproducible, `6` for
+infrastructure/publication failure, and `7` for malformed model output. Interruption exits `130`.
 
-- **Remaining v0.1:** complete the Task 0.1.11b release documentation and checklist.
-- **v0.2:** add PostgreSQL-backed state, queue workers, FastAPI ingress, LangGraph checkpointing,
-  recovery, bounded retries, and expanded evaluation.
-- **v1.0:** add GitHub App workflows, human approval, observability, resilience hardening, and
-  operational documentation.
+## Local checks
 
-These are roadmap items, not current capabilities. The authoritative sequence and scope are in the
-[execution plan](docs/plan/tracefix-execution-plan.md).
+The canonical repository validation is:
+
+```text
+python -B scripts/check.py
+```
+
+It runs these supported checks in order:
+
+```text
+python -m ruff format --check .
+python -m ruff check .
+python -m mypy app benchmarks scripts
+python -m pytest
+```
+
+Useful focused test commands are:
+
+```text
+python -m pytest tests/unit
+python -m pytest tests/integration
+```
+
+Docker tests skip locally only when the Docker CLI or a usable Linux-container daemon is
+unavailable. A release-gate result must come from an environment where both fixed images are built
+and the applicable Docker tests actually run.
+
+## Live Groq benchmark
+
+The paid live benchmark is separate from installation, the quick start, deterministic CI, and the
+fake-provider path. Do not run it without explicit authorization. It makes real provider requests
+that may incur cost.
+
+Install the live dependency and supply the exact supported profile plus reviewed current prices:
+
+```powershell
+python -m pip install --editable ".[dev,live]"
+$env:MODEL_PROVIDER = "groq"
+$env:MODEL_NAME = "openai/gpt-oss-120b"
+$env:MODEL_TEMPERATURE = "0"
+$env:MODEL_REASONING_EFFORT = "low"
+$env:MODEL_MAX_TOKENS = "4096"
+$env:PROMPT_VERSION = "repair-v1.0"
+$env:MODEL_REQUEST_TIMEOUT_SECONDS = "120"
+$env:MODEL_INPUT_PRICE_USD_PER_MILLION_TOKENS = "<reviewed current rate>"
+$env:MODEL_OUTPUT_PRICE_USD_PER_MILLION_TOKENS = "<reviewed current rate>"
+$env:GROQ_API_KEY = "<credential>"
+tracefix benchmark --split development --provider groq
+```
+
+All five cases run sequentially and receive one repair attempt each. A shared pacer keeps real Groq
+request starts at least 61 seconds apart across planning, patch generation, and case boundaries, so
+the benchmark intentionally takes several minutes. Repair outcomes such as `candidate_failure`,
+`policy_violation`, `static_check_failure`, or `malformed_model_output` are valid benchmark evidence;
+the completed benchmark still exits `0`. Provider, platform, baseline, cleanup, artifact, or report
+publication failure is classified separately as an execution failure, stops later paid work, and
+exits `6`.
+
+Each invocation publishes safe reports at:
+
+```text
+.tracefix/benchmarks/<benchmark_run_id>/report.json
+.tracefix/benchmarks/<benchmark_run_id>/report.md
+```
+
+The reports record ordered outcomes and aggregate latency, provider-reported token usage, and
+operator-rate-based estimated cost. They are evaluation evidence, not a provider invoice. The
+per-case metadata-only artifacts remain under `.tracefix/artifacts/`.
+
+The GitHub Actions workflow [`.github/workflows/live-benchmark.yml`](.github/workflows/live-benchmark.yml)
+is independently triggered with **Actions → Live benchmark → Run workflow**. It has only a
+`workflow_dispatch` trigger and is not a push or pull-request check. Its inputs select the fixed
+development/Groq/model profile, timeout, and reviewed prices. Repository secrets `GROQ_API_KEY`
+and `LANGSMITH_API_KEY` must be configured without exposing their values. The workflow enables only
+TraceFix's controlled metadata-only LangSmith diagnostics and uploads the safe reports and per-case
+artifacts.
+
+### Latest authorized live evidence
+
+GitHub Actions run `43335813246`, benchmark run
+`b9dbf2b34cf749fab238885a8441fd54`, is a small five-case development benchmark:
+
+- attempted: 5
+- repair success: 1
+- repair failure: 4
+- execution failure: 0
+- not run: 0
+- exit code: 0
+
+`exception_handling` completed patch-envelope validation, path agreement, patch policy, static
+checks, sandbox verification, and evaluation. `boundary_condition`, `fixture_or_mocking`,
+`incorrect_conditional`, and `incorrect_return_value` failed during unified-diff parsing. This 1/5
+result is evidence about that one development run, not general model accuracy or production
+readiness.
+
+## Sandbox security
+
+Untrusted benchmark and candidate code never executes directly on the host. Containers use no
+network, a read-only root filesystem, numeric user/group `10001:10001`, dropped capabilities,
+`no-new-privileges`, Docker's built-in seccomp profile, bounded CPU/memory/PIDs/time/output, and only
+explicit temporary writable mounts. The repository and hidden-test bundle are mounted read-only;
+the Docker socket, developer home, application/provider credentials, proxy settings, and host
+secrets are not mounted or inherited. Protected and unsafe paths are rejected before execution.
+
+The Docker daemon, container engine, project-owned images, and host administrator remain trusted.
+See the [sandbox hardening specification](docs/specs/0.1-003c-security-hardening.md) for the detailed
+boundary.
+
+## Current limitations
+
+- Exactly one repair attempt is made; there are no repair retries.
+- State is in memory only: there is no persistence.
+- Execution is synchronous: there is no queue or worker service.
+- There is no GitHub integration.
+- LangGraph has no checkpointer or checkpoint recovery.
+- There is no production observability system. Controlled, metadata-only LangSmith diagnostics are
+  available only for authorized live benchmark runs and do not expose prompts, repository source,
+  model responses, patches/diffs, hidden tests, credentials, raw exceptions, or account identifiers.
+- The benchmark contains only five small seeded development cases. In the latest authorized live
+  run, four of five cases failed during unified-diff parsing.
+- There is no API, provider/model comparison, statistical confidence interval, or claim that
+  TraceFix reliably repairs arbitrary repositories.
+
+Planned persistence, queues, API ingress, checkpoint recovery, GitHub integration, and production
+observability are future work, not current functionality.
 
 ## Documentation
 
-- [Implementation progress](docs/progress.md)
-- [System architecture](docs/architecture/tracefix-system-architecture.md)
-- [Execution plan](docs/plan/tracefix-execution-plan.md)
-- [Task specifications](docs/specs/)
-- [Engineering and security rules](AGENTS.md)
+- [v0.1 release checklist](docs/release/v0.1-checklist.md)
+- [implementation progress](docs/progress.md)
+- [system architecture](docs/architecture/tracefix-system-architecture.md)
+- [execution plan](docs/plan/tracefix-execution-plan.md)
+- [task specifications](docs/specs/)
+- [engineering and security rules](AGENTS.md)

@@ -1438,7 +1438,7 @@ Example environment configuration:
 
 ```text
 MODEL_PROVIDER=groq
-MODEL_NAME=llama-3.3-70b-versatile
+MODEL_NAME=openai/gpt-oss-120b
 MODEL_TEMPERATURE=0
 MODEL_MAX_TOKENS=4096
 PROMPT_VERSION=repair-v1.0
